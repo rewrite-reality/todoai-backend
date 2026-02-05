@@ -1,0 +1,262 @@
+// ============================================================================
+// Todo AI - Production-Ready Prisma Schema
+// Version: 2.2.0 (Strict Types)
+// Architecture: AI-First Task Manager with Telegram Integration
+// ============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "postgresqlExtensions"]
+  output          = "./generated/prisma" // Required in Prisma 7
+}
+
+datasource db {
+  provider   = "postgresql"
+  extensions = [pgcrypto]
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+enum TaskStatus {
+  BACKLOG
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  DONE
+  ARCHIVED
+}
+
+enum TaskPriority {
+  NONE
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+//  NEW: Strict input types
+enum InputType {
+  TEXT
+  VOICE
+}
+
+enum ChatRole {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum ActionType {
+  CREATE
+  UPDATE
+  DELETE
+  RESTORE
+  AI_MUTATION
+  REORDER
+}
+
+enum EntityType {
+  PROJECT
+  TASK
+  SUBTASK
+  CHAT_MESSAGE
+}
+
+enum SubscriptionTier {
+  FREE
+  PRO
+  TEAM
+}
+
+// ============================================================================
+// MODELS
+// ============================================================================
+
+model User {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  telegramId    BigInt  @unique @map("telegram_id")
+  telegramName  String? @map("telegram_name") @db.VarChar(255)
+  telegramPhoto String? @map("telegram_photo") @db.VarChar(512)
+
+  encryptedApiKey String? @map("encrypted_api_key") @db.Text
+
+  tier             SubscriptionTier @default(FREE)
+  aiCreditsUsed    Int              @default(0) @map("ai_credits_used")
+  aiCreditsResetAt DateTime?        @map("ai_credits_reset_at")
+
+  timezone    String  @default("UTC") @db.VarChar(50)
+  locale      String  @default("en") @db.VarChar(10)
+  isOnboarded Boolean @default(false) @map("is_onboarded")
+
+  deletedAt DateTime? @map("deleted_at")
+
+  // Relations
+  projects Project[]
+  tasks    Task[]
+
+  // Действия, которые совершил пользователь (автор)
+  actionHistory ActionHistory[] @relation("ActionAuthor")
+
+  //  NEW: Действия, которые этот пользователь ОТМЕНИЛ (undo)
+  undoneActions ActionHistory[] @relation("ActionUndoneBy")
+
+  @@index([telegramId])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model Project {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  name        String  @db.VarChar(255)
+  description String? @db.Text
+  emoji       String? @db.VarChar(10)
+  color       String? @db.VarChar(7)
+
+  aiContext String? @map("ai_context") @db.Text
+  order     Int     @default(0)
+
+  parentId String?   @map("parent_id") @db.Uuid
+  parent   Project?  @relation("ProjectHierarchy", fields: [parentId], references: [id], onDelete: SetNull)
+  children Project[] @relation("ProjectHierarchy")
+
+  isArchived Boolean   @default(false) @map("is_archived")
+  deletedAt  DateTime? @map("deleted_at")
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  tasks Task[]
+
+  @@index([userId, deletedAt])
+  @@index([userId, order])
+  @@map("projects")
+}
+
+model Task {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  title   String  @db.VarChar(500)
+  summary String? @db.Text
+
+  originalInput     String?    @map("original_input") @db.Text
+  //  NEW: Enum instead of String
+  originalInputType InputType? @map("original_input_type")
+
+  status   TaskStatus   @default(TODO)
+  priority TaskPriority @default(NONE)
+
+  deadline         DateTime?
+  startDate        DateTime? @map("start_date")
+  estimatedMinutes Int?      @map("estimated_minutes")
+  order            Int       @default(0)
+
+  aiProcessedAt DateTime? @map("ai_processed_at")
+  aiModelUsed   String?   @map("ai_model_used") @db.VarChar(50)
+  aiTokensUsed  Int?      @map("ai_tokens_used")
+
+  deletedAt DateTime? @map("deleted_at")
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  projectId String?  @map("project_id") @db.Uuid
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  subtasks     Subtask[]
+  chatMessages ChatMessage[]
+
+  @@index([userId, deletedAt])
+  @@index([userId, status, deletedAt])
+  @@index([userId, deadline, deletedAt])
+  @@index([projectId, order])
+  @@map("tasks")
+}
+
+model Subtask {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  title       String    @db.VarChar(500)
+  isCompleted Boolean   @default(false) @map("is_completed")
+  completedAt DateTime? @map("completed_at")
+  order       Int       @default(0)
+
+  isAiGenerated Boolean   @default(false) @map("is_ai_generated")
+  deletedAt     DateTime? @map("deleted_at")
+
+  taskId String @map("task_id") @db.Uuid
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, deletedAt, order])
+  @@map("subtasks")
+}
+
+model ChatMessage {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  role       ChatRole
+  content    String   @db.Text
+  isExcluded Boolean  @default(false) @map("is_excluded")
+
+  aiModelUsed  String? @map("ai_model_used") @db.VarChar(50)
+  aiTokensUsed Int?    @map("ai_tokens_used")
+
+  appliedAt  DateTime?      @map("applied_at")
+  mutationId String?        @map("mutation_id") @db.Uuid
+  mutation   ActionHistory? @relation(fields: [mutationId], references: [id], onDelete: SetNull)
+
+  deletedAt DateTime? @map("deleted_at")
+
+  taskId String @map("task_id") @db.Uuid
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@index([taskId, deletedAt, createdAt])
+  @@index([taskId, isExcluded])
+  @@index([mutationId])
+  @@map("chat_messages")
+}
+
+model ActionHistory {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Автор действия
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation("ActionAuthor", fields: [userId], references: [id], onDelete: Cascade)
+
+  actionType ActionType @map("action_type")
+  entityType EntityType @map("entity_type")
+  entityId   String     @map("entity_id") @db.Uuid
+
+  payload Json @db.JsonB
+
+  aiPromptUsed String? @map("ai_prompt_used") @db.Text
+  aiModelUsed  String? @map("ai_model_used") @db.VarChar(50)
+  aiTokensUsed Int?    @map("ai_tokens_used")
+
+  isUndone Boolean   @default(false) @map("is_undone")
+  undoneAt DateTime? @map("undone_at")
+
+  //  NEW: Кто отменил (Relation)
+  undoneById String? @map("undone_by_id") @db.Uuid
+  undoneBy   User?   @relation("ActionUndoneBy", fields: [undoneById], references: [id], onDelete: SetNull)
+
+  chatMessages ChatMessage[]
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([entityType, entityId, createdAt(sort: Desc)])
+  @@index([isUndone, createdAt(sort: Desc)])
+  @@map("action_history")
+}
