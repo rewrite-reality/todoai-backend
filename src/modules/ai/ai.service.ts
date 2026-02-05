@@ -3,96 +3,95 @@ import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 import { zodResponseFormat } from 'openai/helpers/zod';
 import { TASK_PARSER_SYSTEM_PROMPT } from './prompts/task-parser.prompt';
-import {
-	ParsedTask,
-	ParsedTaskSchema,
-} from './validators/ai-output.validator';
+import { ParsedTask, ParsedTaskSchema } from './validators/ai-output.validator';
 
 @Injectable()
 export class AiService {
-	private readonly logger = new Logger(AiService.name);
-	private readonly openai: OpenAI;
+  private readonly logger = new Logger(AiService.name);
+  private readonly client: OpenAI;
+  private readonly model: string;
+  private readonly baseUrl: string | undefined;
 
-	constructor(private readonly config: ConfigService) {
-		this.openai = new OpenAI({
-			apiKey: this.config.get<string>('AI_API_KEY'),
-			baseURL: this.config.get<string>('AI_BASE_URL'),
-		});
-	}
+  constructor(private readonly configService: ConfigService) {
+    this.baseUrl = this.configService.get<string>('AI_BASE_URL');
+    this.model = this.configService.get<string>('AI_MODEL') ?? 'gpt-4o-mini';
 
-	async parseTask(input: string, timezone = 'UTC'): Promise<ParsedTask> {
-		try {
-			// Проверяем, используем ли мы Google (костыль для тестов)
-			const isGoogle = this.config.get('AI_BASE_URL')?.includes('googleapis');
+    this.client = new OpenAI({
+      apiKey: this.configService.get<string>('AI_API_KEY'),
+      baseURL: this.baseUrl,
+    });
+  }
 
-			const params: any = {
-				model: this.config.get<string>('AI_MODEL', 'deepseek-chat'),
-				messages: [
-					{
-						role: 'system',
-						// Для Google добавляем явную просьбу вернуть JSON в тексте промпта
-						content: TASK_PARSER_SYSTEM_PROMPT(new Date().toISOString(), timezone) + (isGoogle ? " RETURN ONLY RAW JSON." : ""),
-					},
-					{ role: 'user', content: input },
-				],
-			};
+  async parseTask(input: string, timezone = 'UTC'): Promise<ParsedTask> {
+    try {
+      const isGoogle = this.baseUrl?.includes('googleapis') ?? false;
+      const safeTimezone = timezone?.trim() || 'UTC';
+      const systemPrompt = `${TASK_PARSER_SYSTEM_PROMPT(
+        new Date().toISOString(),
+        safeTimezone,
+      )}${isGoogle ? ' RETURN ONLY VALID JSON.' : ''}`;
 
-			// Если это НЕ Google, включаем строгий режим (DeepSeek/Timeweb/OpenAI)
-			if (!isGoogle) {
-				params.response_format = zodResponseFormat(ParsedTaskSchema, 'parsed_task');
-			} else {
-				// Для Google просим JSON Mode (старый способ)
-				params.response_format = { type: 'json_object' };
-			}
+      if (isGoogle) {
+        const response = await this.client.chat.completions.create({
+          model: this.model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: input },
+          ],
+          response_format: { type: 'json_object' },
+        });
 
-			const response = await this.openai.chat.completions.create(params);
+        const content = response.choices[0]?.message?.content;
+        if (!content) {
+          throw new Error('Empty AI response content');
+        }
 
-			// Магия получения результата
-			let parsed: ParsedTask | null = null;
-			const message = response.choices[0]?.message;
+        const cleaned = content
+          .trim()
+          .replace(/^```(?:json)?\s*/i, '')
+          .replace(/\s*```$/i, '')
+          .trim();
 
-			if (!isGoogle) {
-				// 1. Если сработал Zod (DeepSeek)
-				parsed = (message as unknown as { parsed?: ParsedTask })?.parsed ?? null;
-			}
+        const parsed = JSON.parse(cleaned) as unknown;
+        return ParsedTaskSchema.parse(parsed);
+      }
 
-			if (!parsed && message?.content) {
-				// 2. Если пришел текст (Google), парсим руками
-				try {
-					parsed = JSON.parse(message.content);
-				} catch (e) {
-					throw new Error('Failed to parse JSON string from AI');
-				}
-			}
+      const response = await this.client.chat.completions.parse({
+        model: this.model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: input },
+        ],
+        response_format: zodResponseFormat(ParsedTaskSchema, 'parsed_task'),
+      });
 
-			if (!parsed) {
-				throw new Error('AI response missing data');
-			}
+      const parsed = response.choices[0]?.message?.parsed;
+      return ParsedTaskSchema.parse(parsed);
+    } catch (error) {
+      this.logger.warn(
+        `AI parseTask failed, using fallback: ${
+          error instanceof Error ? error.message : 'Unknown error'
+        }`,
+      );
 
-			// На всякий случай прогоняем через Zod валидацию еще раз (для Google)
-			// Чтобы убедиться, что типы верные
-			return ParsedTaskSchema.parse(parsed);
+      const normalizedInput = input?.trim() ?? '';
+      const title = normalizedInput.slice(0, 100);
+      const isTruncated = normalizedInput.length > 100;
 
-		} catch (error) {
-			this.logger.error(
-				'Failed to parse task with AI',
-				error instanceof Error ? error.stack : undefined,
-			);
+      const fallback: ParsedTask = {
+        isIgnored: false,
+        tasks: [
+          {
+            title: title || 'Untitled task',
+            deadline: null,
+            summary: isTruncated ? normalizedInput : undefined,
+            subtasks: [],
+            priority: 'MEDIUM',
+          },
+        ],
+      };
 
-			const isLongInput = input.length > 100;
-			const fallbackTitle = isLongInput
-				? `${input.slice(0, 100)}...`
-				: input;
-
-			return {
-				title: fallbackTitle,
-				summary: isLongInput ? input : undefined,
-				subtasks: [],
-				priority: 'MEDIUM',
-				isIgnored: false,
-				deadline: null,
-			};
-		}
-	}
-
+      return fallback;
+    }
+  }
 }
