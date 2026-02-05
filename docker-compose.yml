@@ -1,0 +1,42 @@
+version: '4.59.0'
+
+services:
+  # 1. База данных PostgreSQL
+  postgres:
+    image: postgres:16-alpine
+    container_name: todoai_postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-todoai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-todoai_password}
+      POSTGRES_DB: ${POSTGRES_DB:-todoai_db}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-todoai} -d ${POSTGRES_DB:-todoai_db}" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # 2. Redis (для очередей BullMQ и кеша)
+  redis:
+    image: redis:7-alpine
+    container_name: todoai_redis
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    # Запускаем с паролем из env
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-redis_password}
+    volumes:
+      - redis_data:/data
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_password}", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data:
+  redis_data:
