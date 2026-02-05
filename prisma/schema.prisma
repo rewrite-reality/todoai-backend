@@ -35,7 +35,7 @@ enum TaskPriority {
   URGENT
 }
 
-// ✅ NEW: Strict input types
+//  NEW: Strict input types
 enum InputType {
   TEXT
   VOICE
@@ -101,7 +101,7 @@ model User {
   // Действия, которые совершил пользователь (автор)
   actionHistory ActionHistory[] @relation("ActionAuthor")
   
-  // ✅ NEW: Действия, которые этот пользователь ОТМЕНИЛ (undo)
+  //  NEW: Действия, которые этот пользователь ОТМЕНИЛ (undo)
   undoneActions ActionHistory[] @relation("ActionUndoneBy")
 
   @@index([telegramId])
@@ -148,7 +148,7 @@ model Task {
   summary String? @db.Text
 
   originalInput     String?    @map("original_input") @db.Text
-  // ✅ NEW: Enum instead of String
+  //  NEW: Enum instead of String
   originalInputType InputType? @map("original_input_type")
 
   status   TaskStatus   @default(TODO)
@@ -248,7 +248,7 @@ model ActionHistory {
   isUndone   Boolean   @default(false) @map("is_undone")
   undoneAt   DateTime? @map("undone_at")
   
-  // ✅ NEW: Кто отменил (Relation)
+  //  NEW: Кто отменил (Relation)
   undoneById String?   @map("undone_by_id") @db.Uuid
   undoneBy   User?     @relation("ActionUndoneBy", fields: [undoneById], references: [id], onDelete: SetNull)
 
