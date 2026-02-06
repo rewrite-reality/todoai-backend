@@ -1,4 +1,7 @@
-export const TASK_PARSER_SYSTEM_PROMPT = (currentDate: string, timezone: string) => `
+export const TASK_PARSER_SYSTEM_PROMPT = (
+  currentDate: string,
+  timezone: string,
+) => `
 You are an advanced GTD assistant.
 Current Time: ${currentDate}
 User Timezone: ${timezone}

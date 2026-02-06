@@ -1,6 +1,6 @@
 // ============================================================================
 // Todo AI - Production-Ready Prisma Schema
-// Version: 2.2.0 (Strict Types)
+// Version: 3.0.0 (Task Assignees + Invites + Shared Projects)
 // Architecture: AI-First Task Manager with Telegram Integration
 // ============================================================================
 
@@ -35,7 +35,6 @@ enum TaskPriority {
   URGENT
 }
 
-//  NEW: Strict input types
 enum InputType {
   TEXT
   VOICE
@@ -61,12 +60,43 @@ enum EntityType {
   TASK
   SUBTASK
   CHAT_MESSAGE
+  TASK_ASSIGNEE
 }
 
 enum SubscriptionTier {
   FREE
   PRO
   TEAM
+}
+
+// NEW: Task assignment lifecycle
+enum AssigneeStatus {
+  PENDING
+  CONNECTED
+  DECLINED
+  REVOKED
+}
+
+// NEW: Invite lifecycle
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+// NEW: Invite scope (extensible for future features)
+enum InviteScope {
+  USER_ONLY
+  PROJECT_INVITE
+}
+
+// NEW: Project membership roles
+enum ProjectRole {
+  OWNER
+  ADMIN
+  MEMBER
+  VIEWER
 }
 
 // ============================================================================
@@ -81,7 +111,7 @@ model User {
   telegramId    BigInt  @unique @map("telegram_id")
   telegramName  String? @map("telegram_name") @db.VarChar(255)
   telegramPhoto String? @map("telegram_photo") @db.VarChar(512)
-  
+
   encryptedApiKey String? @map("encrypted_api_key") @db.Text
 
   tier             SubscriptionTier @default(FREE)
@@ -94,15 +124,28 @@ model User {
 
   deletedAt DateTime? @map("deleted_at")
 
-  // Relations
+  // Relations — owned entities
   projects      Project[]
   tasks         Task[]
-  
-  // Действия, которые совершил пользователь (автор)
+
+  // Relations — action history
   actionHistory ActionHistory[] @relation("ActionAuthor")
-  
-  //  NEW: Действия, которые этот пользователь ОТМЕНИЛ (undo)
   undoneActions ActionHistory[] @relation("ActionUndoneBy")
+
+  // NEW: Task assignments where this user IS the assignee
+  assignedTasks TaskAssignee[] @relation("Assignee")
+
+  // NEW: Task assignments created BY this user
+  assignedByMe TaskAssignee[] @relation("AssignedBy")
+
+  // NEW: Invites created by this user
+  createdInvites Invite[] @relation("InviteCreator")
+
+  // NEW: Project memberships
+  projectMemberships ProjectMember[] @relation("MemberUser")
+
+  // NEW: Project memberships where this user invited someone
+  invitedMembers ProjectMember[] @relation("MemberInvitedBy")
 
   @@index([telegramId])
   @@index([deletedAt])
@@ -134,6 +177,12 @@ model Project {
 
   tasks Task[]
 
+  // NEW: Project members (shared access)
+  members ProjectMember[]
+
+  // NEW: Invites scoped to this project
+  invites Invite[]
+
   @@index([userId, deletedAt])
   @@index([userId, order])
   @@map("projects")
@@ -148,7 +197,6 @@ model Task {
   summary String? @db.Text
 
   originalInput     String?    @map("original_input") @db.Text
-  //  NEW: Enum instead of String
   originalInputType InputType? @map("original_input_type")
 
   status   TaskStatus   @default(TODO)
@@ -173,6 +221,9 @@ model Task {
 
   subtasks     Subtask[]
   chatMessages ChatMessage[]
+
+  // NEW: Task-level assignees (0..N)
+  assignees TaskAssignee[]
 
   @@index([userId, deletedAt])
   @@index([userId, status, deletedAt])
@@ -205,18 +256,18 @@ model ChatMessage {
   id        String   @id @default(uuid()) @db.Uuid
   createdAt DateTime @default(now()) @map("created_at")
 
-  role         ChatRole
-  content      String   @db.Text
-  isExcluded   Boolean  @default(false) @map("is_excluded")
+  role       ChatRole
+  content    String  @db.Text
+  isExcluded Boolean @default(false) @map("is_excluded")
 
   aiModelUsed  String? @map("ai_model_used") @db.VarChar(50)
   aiTokensUsed Int?    @map("ai_tokens_used")
-  
-  appliedAt    DateTime?      @map("applied_at")
-  mutationId   String?        @map("mutation_id") @db.Uuid
-  mutation     ActionHistory? @relation(fields: [mutationId], references: [id], onDelete: SetNull)
 
-  deletedAt    DateTime? @map("deleted_at")
+  appliedAt  DateTime?      @map("applied_at")
+  mutationId String?        @map("mutation_id") @db.Uuid
+  mutation   ActionHistory? @relation(fields: [mutationId], references: [id], onDelete: SetNull)
+
+  deletedAt DateTime? @map("deleted_at")
 
   taskId String @map("task_id") @db.Uuid
   task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
@@ -231,7 +282,6 @@ model ActionHistory {
   id        String   @id @default(uuid()) @db.Uuid
   createdAt DateTime @default(now()) @map("created_at")
 
-  // Автор действия
   userId String @map("user_id") @db.Uuid
   user   User   @relation("ActionAuthor", fields: [userId], references: [id], onDelete: Cascade)
 
@@ -247,8 +297,6 @@ model ActionHistory {
 
   isUndone   Boolean   @default(false) @map("is_undone")
   undoneAt   DateTime? @map("undone_at")
-  
-  //  NEW: Кто отменил (Relation)
   undoneById String?   @map("undone_by_id") @db.Uuid
   undoneBy   User?     @relation("ActionUndoneBy", fields: [undoneById], references: [id], onDelete: SetNull)
 
@@ -258,4 +306,136 @@ model ActionHistory {
   @@index([entityType, entityId, createdAt(sort: Desc)])
   @@index([isUndone, createdAt(sort: Desc)])
   @@map("action_history")
+}
+
+// ============================================================================
+// NEW MODELS: Task Assignment, Invite, Project Membership
+// ============================================================================
+
+/// Назначение исполнителя на задачу.
+/// Lifecycle: PENDING (soft assign by @username) → CONNECTED (user arrived via deep-link)
+///            or → DECLINED / REVOKED
+model TaskAssignee {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Which task this assignment belongs to
+  taskId String @map("task_id") @db.Uuid
+  task   Task   @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  // Who created the assignment
+  assignedByUserId String @map("assigned_by_user_id") @db.Uuid
+  assignedBy       User   @relation("AssignedBy", fields: [assignedByUserId], references: [id], onDelete: Cascade)
+
+  // Assignment status
+  status AssigneeStatus @default(PENDING)
+
+  // The Telegram @username used for soft-assign (stored lowercase, without @)
+  // Required for PENDING; kept as historical record after CONNECTED
+  telegramUsername String? @map("telegram_username") @db.VarChar(255)
+
+  // Resolved user — filled when assignee arrives via deep-link
+  assigneeUserId String? @map("assignee_user_id") @db.Uuid
+  assignee       User?   @relation("Assignee", fields: [assigneeUserId], references: [id], onDelete: SetNull)
+
+  // Timestamps
+  invitedAt   DateTime  @default(now()) @map("invited_at")
+  connectedAt DateTime? @map("connected_at")
+  revokedAt   DateTime? @map("revoked_at")
+  declinedAt  DateTime? @map("declined_at")
+
+  // Optional note from assigner
+  note String? @db.Text
+
+  // Soft delete
+  deletedAt DateTime? @map("deleted_at")
+
+  // --- Indexes ---
+  // "Tasks assigned TO me" (after connect)
+  @@index([assigneeUserId, deletedAt])
+  // "All pending assignments for a given username" (for connect resolution)
+  @@index([telegramUsername, status, deletedAt])
+  // "Assignees of a task"
+  @@index([taskId, deletedAt])
+  // "Assignments created by user"
+  @@index([assignedByUserId, deletedAt])
+  @@map("task_assignees")
+}
+
+/// Invite token for connecting an unregistered Telegram user.
+/// Created via /connect_user command. Consumed when target user taps deep-link.
+model Invite {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // Cryptographically random token used in deep-link: t.me/bot?start=invite_{token}
+  token String @unique @db.VarChar(128)
+
+  // Who created the invite
+  createdByUserId String @map("created_by_user_id") @db.Uuid
+  createdBy       User   @relation("InviteCreator", fields: [createdByUserId], references: [id], onDelete: Cascade)
+
+  // Target identification
+  targetTelegramUsername String  @map("target_telegram_username") @db.VarChar(255)
+  targetTelegramId       BigInt? @map("target_telegram_id")
+
+  // Lifecycle
+  status    InviteStatus @default(PENDING)
+  expiresAt DateTime     @map("expires_at")
+  usedAt    DateTime?    @map("used_at")
+  revokedAt DateTime?    @map("revoked_at")
+
+  // Scope: USER_ONLY now, PROJECT_INVITE in the future
+  scope InviteScope @default(USER_ONLY)
+
+  // Optional project binding (for future PROJECT_INVITE scope)
+  projectId String?  @map("project_id") @db.Uuid
+  project   Project? @relation(fields: [projectId], references: [id], onDelete: SetNull)
+
+  // Metadata — can store { taskAssigneeId } to auto-link on acceptance
+  metadata Json? @db.JsonB
+
+  // --- Indexes ---
+  // token is already @unique, so implicit unique index
+  // Lookup pending invites by target username
+  @@index([targetTelegramUsername, status])
+  // Cleanup expired invites
+  @@index([expiresAt, status])
+  // Invites created by user
+  @@index([createdByUserId])
+  @@map("invites")
+}
+
+/// Project membership for future shared/collaborative projects.
+/// Minimal model — no full ACL yet, just role-based membership.
+model ProjectMember {
+  id        String   @id @default(uuid()) @db.Uuid
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  projectId String  @map("project_id") @db.Uuid
+  project   Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation("MemberUser", fields: [userId], references: [id], onDelete: Cascade)
+
+  role ProjectRole @default(MEMBER)
+
+  // Who invited this member (null for the original OWNER)
+  invitedByUserId String? @map("invited_by_user_id") @db.Uuid
+  invitedBy       User?   @relation("MemberInvitedBy", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  joinedAt DateTime @default(now()) @map("joined_at")
+
+  // Soft delete
+  deletedAt DateTime? @map("deleted_at")
+
+  // --- Indexes ---
+  // "My projects" — fast lookup
+  @@index([userId, deletedAt])
+  // "Members of a project"
+  @@index([projectId, deletedAt])
+  @@map("project_members")
 }

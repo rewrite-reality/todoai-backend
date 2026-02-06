@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: todoai_test
+      POSTGRES_PASSWORD: todoai_test_password
+      POSTGRES_DB: todoai_db_test
+    ports:
+      - '55433:5432'
+    volumes:
+      - postgres_data_test:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ 'CMD-SHELL', 'pg_isready -U todoai_test -d todoai_db_test' ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes --requirepass redis_test_password
+    ports:
+      - '56380:6379'
+    volumes:
+      - redis_data_test:/data
+    restart: unless-stopped
+    healthcheck:
+      test: [ 'CMD', 'redis-cli', '-a', 'redis_test_password', 'ping' ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  postgres_data_test:
+  redis_data_test:

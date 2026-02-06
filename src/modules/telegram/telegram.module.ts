@@ -4,9 +4,9 @@ import { TelegramService } from './telegram.service';
 import { QueueModule } from '../queue/queue.module';
 
 @Module({
-	imports: [QueueModule], // Импортируем, чтобы работали очереди
-	controllers: [TelegramController],
-	providers: [TelegramService],
-	exports: [TelegramService],
+  imports: [QueueModule], // Импортируем, чтобы работали очереди
+  controllers: [TelegramController],
+  providers: [TelegramService],
+  exports: [TelegramService],
 })
-export class TelegramModule { }
+export class TelegramModule {}
