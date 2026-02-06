@@ -1,2 +1,2 @@
 -- DropIndex
-DROP INDEX "idx_action_history_payload_gin";
+DROP INDEX IF EXISTS "idx_action_history_payload_gin";

@@ -5,16 +5,16 @@ import { QUEUES } from '../queues.config';
 import { PinoLoggerService } from '../../../common/logger/pino-logger.service';
 
 @Injectable()
-@Processor(QUEUES.VOICE_TRANSCRIPTION)
-export class VoiceTranscriptionProcessor extends WorkerHost {
+@Processor(QUEUES.INVITE_ACCEPTANCE)
+export class InviteAcceptanceProcessor extends WorkerHost {
   constructor(private readonly logger: PinoLoggerService) {
     super();
   }
 
   async process(job: Job<Record<string, unknown>>): Promise<void> {
     this.logger.log({
-      msg: 'Voice transcription job received',
-      queue: QUEUES.VOICE_TRANSCRIPTION,
+      msg: 'Invite acceptance command job received',
+      queue: QUEUES.INVITE_ACCEPTANCE,
       jobId: job.id,
       correlationId: job.data.correlationId,
     });

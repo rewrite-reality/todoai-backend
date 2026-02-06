@@ -20,4 +20,9 @@ export const QUEUES = {
   VOICE_TRANSCRIPTION: 'voice-transcription',
   TASK_PARSING: 'task-parsing',
   NOTIFICATIONS: 'notifications',
+  USER_CONNECTION: 'user-connection',
+  INVITE_ACCEPTANCE: 'invite-acceptance',
+  INVITE_DECLINE: 'invite-decline',
+  ASSIGNEE_REVOKE: 'assignee-revoke',
+  ASSIGNMENTS_LIST: 'assignments-list',
 } as const;
