@@ -2,6 +2,16 @@ import { createTestApp, TestApplication } from '../helpers/app';
 import { PrismaService } from '../../src/prisma/prisma.service';
 import { RedisService } from '../../src/common/redis/redis.service';
 
+interface HealthErrorBody {
+  error: {
+    code: string;
+    details: {
+      database: 'up' | 'down';
+      redis: 'up' | 'down';
+    };
+  };
+}
+
 describe('Health endpoint (e2e)', () => {
   let testApp: TestApplication;
   let prisma: PrismaService;
@@ -36,10 +46,11 @@ describe('Health endpoint (e2e)', () => {
     jest.spyOn(prisma, '$queryRaw').mockRejectedValueOnce(new Error('db down'));
 
     const res = await testApp.request.get('/health');
+    const body = res.body as HealthErrorBody;
 
     expect(res.status).toBe(503);
-    expect(res.body.error.code).toBe('HEALTH_DEGRADED');
-    expect(res.body.error.details).toMatchObject({
+    expect(body.error.code).toBe('HEALTH_DEGRADED');
+    expect(body.error.details).toMatchObject({
       database: 'down',
       redis: 'up',
     });
@@ -49,10 +60,11 @@ describe('Health endpoint (e2e)', () => {
     jest.spyOn(redis, 'ping').mockRejectedValueOnce(new Error('redis down'));
 
     const res = await testApp.request.get('/health');
+    const body = res.body as HealthErrorBody;
 
     expect(res.status).toBe(503);
-    expect(res.body.error.code).toBe('HEALTH_DEGRADED');
-    expect(res.body.error.details).toMatchObject({
+    expect(body.error.code).toBe('HEALTH_DEGRADED');
+    expect(body.error.details).toMatchObject({
       database: 'up',
       redis: 'down',
     });

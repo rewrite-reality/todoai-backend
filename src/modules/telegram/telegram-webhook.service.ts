@@ -1,4 +1,9 @@
-import { ForbiddenException, HttpException, HttpStatus, Injectable } from '@nestjs/common';
+import {
+  ForbiddenException,
+  HttpException,
+  HttpStatus,
+  Injectable,
+} from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PinoLoggerService } from '../../common/logger/pino-logger.service';
 import { UserService } from '../user/user.service';
@@ -119,7 +124,9 @@ export class TelegramWebhookService {
   }
 
   private validateSecret(secretToken: string | undefined): void {
-    const expectedSecret = this.configService.get<string>('TELEGRAM_WEBHOOK_SECRET');
+    const expectedSecret = this.configService.get<string>(
+      'TELEGRAM_WEBHOOK_SECRET',
+    );
 
     if (!expectedSecret || secretToken !== expectedSecret) {
       throw new ForbiddenException({

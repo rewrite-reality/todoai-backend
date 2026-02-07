@@ -16,12 +16,13 @@ export async function createTestApp(): Promise<TestApplication> {
   }).compile();
 
   const app = moduleRef.createNestApplication();
-  await configureApp(app);
+  configureApp(app);
   await app.init();
+  const httpServer = app.getHttpServer() as Parameters<typeof request>[0];
 
   return {
     app,
-    request: request(app.getHttpServer()),
+    request: request(httpServer),
     close: () => app.close(),
   };
 }

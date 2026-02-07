@@ -11,12 +11,13 @@ export class InviteDeclineProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<Record<string, unknown>>): Promise<void> {
+  process(job: Job<Record<string, unknown>>): Promise<void> {
     this.logger.log({
       msg: 'Invite decline command job received',
       queue: QUEUES.INVITE_DECLINE,
       jobId: job.id,
       correlationId: job.data.correlationId,
     });
+    return Promise.resolve();
   }
 }

@@ -11,12 +11,13 @@ export class NotificationProcessor extends WorkerHost {
     super();
   }
 
-  async process(job: Job<Record<string, unknown>>): Promise<void> {
+  process(job: Job<Record<string, unknown>>): Promise<void> {
     this.logger.log({
       msg: 'Notification command job received',
       queue: QUEUES.NOTIFICATIONS,
       jobId: job.id,
       correlationId: job.data.correlationId,
     });
+    return Promise.resolve();
   }
 }

@@ -42,7 +42,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     body: ErrorBody;
   } {
     if (exception instanceof HttpException) {
-      const status = exception.getStatus();
+      const status = exception.getStatus() as HttpStatus;
       const res = exception.getResponse();
       const responsePayload =
         typeof res === 'string'
@@ -79,7 +79,7 @@ export class AllExceptionsFilter implements ExceptionFilter {
     };
   }
 
-  private mapHttpStatusToCode(status: number): string {
+  private mapHttpStatusToCode(status: HttpStatus): string {
     switch (status) {
       case HttpStatus.BAD_REQUEST:
         return 'BAD_REQUEST';

@@ -1,41 +1,20 @@
 import { Injectable, LoggerService } from '@nestjs/common';
+import pino from 'pino';
 import { RequestContextService } from '../context/request-context.service';
 
 type PinoInstance = {
   child: (bindings?: Record<string, unknown>) => PinoInstance;
-  info: (...args: any[]) => void;
-  warn: (...args: any[]) => void;
-  error: (...args: any[]) => void;
-  debug: (...args: any[]) => void;
+  info: (...args: unknown[]) => void;
+  warn: (...args: unknown[]) => void;
+  error: (...args: unknown[]) => void;
+  debug: (...args: unknown[]) => void;
 };
-
-function getPino(): (options?: Record<string, unknown>) => PinoInstance {
-  try {
-    const loaded = require('pino') as (
-      options?: Record<string, unknown>,
-    ) => PinoInstance;
-    return loaded;
-  } catch {
-    const fallbackFactory = () => {
-      const fallback: PinoInstance = {
-        child: () => fallback,
-        info: console.log,
-        warn: console.warn,
-        error: console.error,
-        debug: console.debug,
-      };
-      return fallback;
-    };
-    return fallbackFactory;
-  }
-}
 
 @Injectable()
 export class PinoLoggerService implements LoggerService {
   private readonly logger: PinoInstance;
 
   constructor(private readonly context: RequestContextService) {
-    const pino = getPino();
     this.logger = pino({
       level: process.env.LOG_LEVEL ?? 'info',
       base: undefined,
@@ -47,11 +26,11 @@ export class PinoLoggerService implements LoggerService {
     return correlationId ? this.logger.child({ correlationId }) : this.logger;
   }
 
-  log(message: any, ...optionalParams: any[]) {
+  log(message: unknown, ...optionalParams: unknown[]) {
     this.withContext().info(message, ...optionalParams);
   }
 
-  error(message: any, ...optionalParams: any[]) {
+  error(message: unknown, ...optionalParams: unknown[]) {
     const payload =
       message instanceof Error
         ? { err: message, msg: message.message }
@@ -59,11 +38,11 @@ export class PinoLoggerService implements LoggerService {
     this.withContext().error(payload, ...optionalParams);
   }
 
-  warn(message: any, ...optionalParams: any[]) {
+  warn(message: unknown, ...optionalParams: unknown[]) {
     this.withContext().warn(message, ...optionalParams);
   }
 
-  debug?(message: any, ...optionalParams: any[]) {
+  debug?(message: unknown, ...optionalParams: unknown[]) {
     this.withContext().debug(message, ...optionalParams);
   }
 }
