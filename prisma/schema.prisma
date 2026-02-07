@@ -25,6 +25,7 @@ enum TaskStatus {
   BLOCKED
   DONE
   ARCHIVED
+  PARSE_FAILED
 }
 
 enum TaskPriority {

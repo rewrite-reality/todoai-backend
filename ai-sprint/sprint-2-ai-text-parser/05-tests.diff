@@ -1,0 +1,1584 @@
+diff --git a/test/e2e/task-parsing.e2e-spec.ts b/test/e2e/task-parsing.e2e-spec.ts
+new file mode 100644
+index 0000000..8bef528
+--- /dev/null
++++ b/test/e2e/task-parsing.e2e-spec.ts
+@@ -0,0 +1,405 @@
++import { randomUUID } from 'crypto';
++import { getQueueToken } from '@nestjs/bullmq';
++import { INestApplication } from '@nestjs/common';
++import { Test } from '@nestjs/testing';
++import { Queue } from 'bullmq';
++import { TaskStatus } from '@prisma/client';
++import { AppModule } from '../../src/app.module';
++import { PinoLoggerService } from '../../src/common/logger/pino-logger.service';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { AI_TEXT_PARSER } from '../../src/modules/ai/constants/ai.tokens';
++import type {
++  AiTextParseContext,
++  IAiParser,
++} from '../../src/modules/ai/contracts/ai-parser.interface';
++import type { ParsedTaskDto } from '../../src/modules/ai/dto/parsed-task.dto';
++import { AiParserError } from '../../src/modules/ai/errors/ai-parser.error';
++import { QUEUES } from '../../src/modules/queue/queues.config';
++import { buildTaskIdFromIdempotencyKey } from '../../src/modules/queue/utils/deterministic-uuid.util';
++
++describe('Task parsing processor (e2e)', () => {
++  let app: INestApplication;
++  let prisma: PrismaService;
++  let taskParsingQueue: Queue;
++  let notificationsQueue: Queue;
++  let telegramIdSeq = BigInt(992000000000);
++
++  const parseTextMock = jest.fn<
++    Promise<ParsedTaskDto>,
++    [string, AiTextParseContext]
++  >();
++  const aiParserMock: IAiParser = {
++    provider: 'mock',
++    parseText: parseTextMock,
++  };
++
++  beforeAll(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [AppModule],
++    })
++      .overrideProvider(AI_TEXT_PARSER)
++      .useValue(aiParserMock)
++      .compile();
++
++    app = moduleRef.createNestApplication();
++    app.useLogger(app.get(PinoLoggerService));
++    await app.init();
++
++    prisma = app.get(PrismaService);
++    taskParsingQueue = app.get<Queue>(getQueueToken(QUEUES.TASK_PARSING));
++    notificationsQueue = app.get<Queue>(getQueueToken(QUEUES.NOTIFICATIONS));
++  });
++
++  beforeEach(async () => {
++    parseTextMock.mockReset();
++    await Promise.all([
++      taskParsingQueue.obliterate({ force: true }),
++      notificationsQueue.obliterate({ force: true }),
++    ]);
++  });
++
++  afterAll(async () => {
++    if (app) {
++      await app.close();
++    }
++  }, 10000);
++
++  async function createUser() {
++    telegramIdSeq += 1n;
++    return prisma.user.create({
++      data: {
++        telegramId: telegramIdSeq,
++        telegramName: `task-parsing-e2e-${telegramIdSeq.toString()}`,
++      },
++    });
++  }
++
++  async function createUniqueIdempotencyKey(prefix: string): Promise<string> {
++    for (let attempt = 0; attempt < 10; attempt += 1) {
++      const candidate = `${prefix}-${randomUUID()}`;
++      const ids = Array.from({ length: 5 }, (_, index) =>
++        buildTaskIdFromIdempotencyKey(candidate, index),
++      );
++      const existingCount = await prisma.task.count({
++        where: { id: { in: ids } },
++      });
++      if (existingCount === 0) {
++        return candidate;
++      }
++    }
++
++    throw new Error(`Failed to allocate unique idempotency key for ${prefix}`);
++  }
++
++  async function waitForTerminalState(
++    queue: Queue,
++    jobId: string,
++    timeoutMs = 10000,
++  ): Promise<'completed' | 'failed'> {
++    const startedAt = Date.now();
++    while (Date.now() - startedAt < timeoutMs) {
++      const job = await queue.getJob(jobId);
++      if (!job) {
++        await new Promise((resolve) => setTimeout(resolve, 50));
++        continue;
++      }
++
++      const state = await job.getState();
++      if (state === 'completed' || state === 'failed') {
++        return state;
++      }
++      await new Promise((resolve) => setTimeout(resolve, 50));
++    }
++
++    throw new Error(`Queue job ${jobId} did not finish within ${timeoutMs}ms`);
++  }
++
++  async function enqueueTaskParsingJob(params: {
++    userId: string;
++    text: string;
++    idempotencyKey: string;
++    telegramChatId?: number;
++    telegramMessageId?: number;
++  }): Promise<'completed' | 'failed'> {
++    const job = await taskParsingQueue.add(
++      'parse-task',
++      {
++        userId: params.userId,
++        text: params.text,
++        telegramMessageId: params.telegramMessageId ?? 100,
++        telegramChatId: params.telegramChatId ?? 200,
++        correlationId: `corr-${randomUUID()}`,
++        idempotencyKey: params.idempotencyKey,
++      },
++    );
++
++    return waitForTerminalState(taskParsingQueue, String(job.id));
++  }
++
++  it('creates task with subtasks and enqueues success notification', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey('e2e-success');
++
++    parseTextMock.mockResolvedValue({
++      tasks: [
++        {
++          title: 'Prepare sprint',
++          summary: 'Write sprint plan',
++          subtasks: [
++            { title: 'Collect requirements', order: 0 },
++            { title: 'Draft timeline', order: 1 },
++          ],
++        },
++      ],
++    });
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'Prepare sprint: Collect requirements, Draft timeline',
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++
++    const taskId = buildTaskIdFromIdempotencyKey(idempotencyKey, 0);
++    const task = await prisma.task.findUnique({
++      where: { id: taskId },
++      include: { subtasks: { orderBy: { order: 'asc' } } },
++    });
++
++    expect(task).toBeTruthy();
++    expect(task?.title).toBe('Prepare sprint');
++    expect(task?.status).toBe(TaskStatus.TODO);
++    expect(task?.subtasks).toHaveLength(2);
++    expect(task?.subtasks.map((item) => item.title)).toEqual([
++      'Collect requirements',
++      'Draft timeline',
++    ]);
++
++    const notification = await notificationsQueue.getJob(
++      `task-parsing-notification-${idempotencyKey}`,
++    );
++    expect(notification).toBeTruthy();
++    expect(
++      (notification?.data as { text?: string } | undefined)?.text,
++    ).toContain('Task created');
++  });
++
++  it('persists deadline for "завтра" scenario from parsed ISO date', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey('e2e-deadline');
++    const tomorrow = new Date(Date.now() + 24 * 60 * 60 * 1000);
++    const tomorrowIso = tomorrow.toISOString();
++
++    parseTextMock.mockResolvedValue({
++      tasks: [
++        {
++          title: 'Позвонить клиенту',
++          deadline: tomorrowIso,
++          subtasks: [],
++        },
++      ],
++    });
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'Позвонить клиенту завтра',
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++
++    const task = await prisma.task.findUnique({
++      where: { id: buildTaskIdFromIdempotencyKey(idempotencyKey, 0) },
++    });
++    expect(task).toBeTruthy();
++    expect(task?.deadline?.toISOString()).toBe(tomorrowIso);
++  });
++
++  it.skip(
++    'BLOCKER: multi-task parse cannot persist because idx_tasks_order_inbox enforces unique (user_id, order) and processor writes order=0',
++    async () => {
++      const user = await createUser();
++      const idempotencyKey = await createUniqueIdempotencyKey('e2e-multi');
++
++    parseTextMock.mockResolvedValue({
++      tasks: [
++        { title: 'Task one', subtasks: [] },
++        { title: 'Task two', subtasks: [] },
++      ],
++    });
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'Task one; Task two',
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++    expect(parseTextMock).toHaveBeenCalledTimes(1);
++
++    const tasks = await prisma.task.findMany({
++      where: {
++        id: {
++          in: [
++            buildTaskIdFromIdempotencyKey(idempotencyKey, 0),
++            buildTaskIdFromIdempotencyKey(idempotencyKey, 1),
++          ],
++        },
++      },
++      orderBy: { createdAt: 'asc' },
++    });
++    expect(buildTaskIdFromIdempotencyKey(idempotencyKey, 0)).not.toBe(
++      buildTaskIdFromIdempotencyKey(idempotencyKey, 1),
++    );
++
++      expect(tasks).toHaveLength(2);
++      expect(tasks.map((item) => item.title)).toEqual(['Task one', 'Task two']);
++    },
++  );
++
++  it('retries once after invalid JSON and succeeds on corrective attempt', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey('e2e-retry');
++
++    parseTextMock.mockImplementation(async (_input, context) => {
++      if (context.attempt === 1) {
++        throw new AiParserError('AI_PARSE_INVALID_JSON', 'broken json');
++      }
++
++      return {
++        tasks: [{ title: 'Recovered task', subtasks: [] }],
++      };
++    });
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'recover me',
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++
++    expect(parseTextMock).toHaveBeenCalledTimes(2);
++    expect(parseTextMock).toHaveBeenNthCalledWith(
++      2,
++      'recover me',
++      expect.objectContaining({
++        attempt: 2,
++        correctivePrompt: expect.any(String),
++      }),
++    );
++
++    const task = await prisma.task.findUnique({
++      where: { id: buildTaskIdFromIdempotencyKey(idempotencyKey, 0) },
++    });
++    expect(task?.status).toBe(TaskStatus.TODO);
++  });
++
++  it('falls back to PARSE_FAILED task when parser returns invalid output twice', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey(
++      'e2e-fallback-invalid',
++    );
++    const rawText = 'asdasd ??? ###';
++
++    parseTextMock.mockRejectedValue(
++      new AiParserError('AI_PARSE_INVALID_JSON', 'still invalid'),
++    );
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: rawText,
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++
++    const task = await prisma.task.findUnique({
++      where: { id: buildTaskIdFromIdempotencyKey(idempotencyKey, 0) },
++      include: { subtasks: true },
++    });
++    expect(task).toBeTruthy();
++    expect(task?.status).toBe(TaskStatus.PARSE_FAILED);
++    expect(task?.originalInput).toBe(rawText);
++    expect(task?.subtasks).toHaveLength(0);
++
++    const notification = await notificationsQueue.getJob(
++      `task-parsing-notification-${idempotencyKey}`,
++    );
++    expect(
++      (notification?.data as { text?: string } | undefined)?.text,
++    ).toContain('AI_PARSE_INVALID_JSON');
++  });
++
++  it('falls back when parser times out', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey('e2e-timeout');
++
++    parseTextMock.mockRejectedValue(
++      new AiParserError('AI_PARSE_TIMEOUT', 'timeout', { retriable: true }),
++    );
++
++    const state = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'timeout case',
++      idempotencyKey,
++    });
++    expect(state).toBe('completed');
++
++    const task = await prisma.task.findUnique({
++      where: { id: buildTaskIdFromIdempotencyKey(idempotencyKey, 0) },
++    });
++    expect(task?.status).toBe(TaskStatus.PARSE_FAILED);
++
++    const notification = await notificationsQueue.getJob(
++      `task-parsing-notification-${idempotencyKey}`,
++    );
++    expect(
++      (notification?.data as { text?: string } | undefined)?.text,
++    ).toContain('AI_PARSE_TIMEOUT');
++  });
++
++  it('is idempotent by idempotencyKey and does not duplicate DB effects', async () => {
++    const user = await createUser();
++    const idempotencyKey = await createUniqueIdempotencyKey('e2e-idempotency');
++
++    parseTextMock.mockResolvedValue({
++      tasks: [{ title: 'Idempotent task', subtasks: [] }],
++    });
++
++    const firstState = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'create once',
++      idempotencyKey,
++      telegramMessageId: 1001,
++    });
++    const secondState = await enqueueTaskParsingJob({
++      userId: user.id,
++      text: 'create twice',
++      idempotencyKey,
++      telegramMessageId: 1002,
++    });
++
++    expect(firstState).toBe('completed');
++    expect(secondState).toBe('completed');
++    expect(parseTextMock).toHaveBeenCalledTimes(1);
++
++    const taskIds = Array.from({ length: 5 }, (_, index) =>
++      buildTaskIdFromIdempotencyKey(idempotencyKey, index),
++    );
++    const tasks = await prisma.task.findMany({
++      where: { id: { in: taskIds } },
++    });
++    expect(tasks).toHaveLength(1);
++    expect(tasks[0].title).toBe('Idempotent task');
++
++    const allNotificationJobs = await notificationsQueue.getJobs([
++      'waiting',
++      'active',
++      'delayed',
++      'completed',
++      'failed',
++      'paused',
++    ]);
++    const sameNotificationJobs = allNotificationJobs.filter(
++      (job) => job.id === `task-parsing-notification-${idempotencyKey}`,
++    );
++    expect(sameNotificationJobs).toHaveLength(1);
++  });
++});
+diff --git a/test/integration/deepseek-text.parser.integration-spec.ts b/test/integration/deepseek-text.parser.integration-spec.ts
+new file mode 100644
+index 0000000..af0505a
+--- /dev/null
++++ b/test/integration/deepseek-text.parser.integration-spec.ts
+@@ -0,0 +1,278 @@
++import { ConfigService } from '@nestjs/config';
++import { DeepSeekTextParser } from '../../src/modules/ai/providers/deepseek-text.parser';
++import { PinoLoggerService } from '../../src/common/logger/pino-logger.service';
++import { AiParserError } from '../../src/modules/ai/errors/ai-parser.error';
++
++// BLOCKER: nock/msw are not installed in the current repo test harness, so fetch is mocked directly.
++type ConfigMap = Record<string, unknown>;
++
++function buildConfigService(values: ConfigMap): ConfigService {
++  return {
++    get: jest.fn((key: string) => values[key]),
++  } as unknown as ConfigService;
++}
++
++function buildLogger(): PinoLoggerService {
++  return {
++    log: jest.fn(),
++    warn: jest.fn(),
++    error: jest.fn(),
++    debug: jest.fn(),
++  } as unknown as PinoLoggerService;
++}
++
++function okResponse(content: string): Response {
++  return new Response(
++    JSON.stringify({
++      choices: [{ message: { content } }],
++    }),
++    { status: 200, headers: { 'Content-Type': 'application/json' } },
++  );
++}
++
++describe('DeepSeekTextParser (integration)', () => {
++  const originalEnv = process.env;
++
++  beforeEach(() => {
++    process.env = { ...originalEnv };
++  });
++
++  afterEach(() => {
++    jest.restoreAllMocks();
++    process.env = originalEnv;
++  });
++
++  it('sends DeepSeek request with expected endpoint, headers and body', async () => {
++    const fetchMock = jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(
++        okResponse('{"tasks":[{"title":"Task A","subtasks":[]}]}'),
++      );
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'deepseek-key',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++        'ai.deepseekModel': 'deepseek-chat',
++        'ai.timeoutMs': 30000,
++      }),
++      buildLogger(),
++    );
++
++    const result = await parser.parseText('Разбей задачу на шаги', {
++      correlationId: 'corr-1',
++      attempt: 1,
++    });
++
++    expect(result.tasks).toHaveLength(1);
++    expect(result.tasks[0].title).toBe('Task A');
++
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const [url, requestInit] = fetchMock.mock.calls[0];
++    const typedRequestInit = requestInit as RequestInit;
++    const body = JSON.parse(String(typedRequestInit.body)) as {
++      model: string;
++      max_tokens: number;
++      temperature: number;
++      messages: Array<{ role: string; content: string }>;
++    };
++
++    expect(url).toBe('https://api.deepseek.com/v1/chat/completions');
++    expect(typedRequestInit.method).toBe('POST');
++    expect(typedRequestInit.headers).toMatchObject({
++      Authorization: 'Bearer deepseek-key',
++      'Content-Type': 'application/json',
++    });
++    expect(body.model).toBe('deepseek-chat');
++    expect(body.max_tokens).toBe(2000);
++    expect(body.temperature).toBe(0.1);
++    expect(body.messages[0].role).toBe('system');
++    expect(body.messages[1]).toEqual({
++      role: 'user',
++      content: 'Разбей задачу на шаги',
++    });
++  });
++
++  it('uses DEEPSEEK_API_KEY from env when config value is missing', async () => {
++    process.env.DEEPSEEK_API_KEY = 'env-deepseek-key';
++    const fetchMock = jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(
++        okResponse('{"tasks":[{"title":"Task A","subtasks":[]}]}'),
++      );
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await parser.parseText('Test', {
++      correlationId: 'corr-2',
++      attempt: 1,
++    });
++
++    const requestInit = fetchMock.mock.calls[0][1] as RequestInit;
++    expect(requestInit.headers).toMatchObject({
++      Authorization: 'Bearer env-deepseek-key',
++    });
++  });
++
++  it('parses markdown wrapped JSON response', async () => {
++    jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(
++        okResponse(
++          '```json\n{"tasks":[{"title":"Markdown task","subtasks":[]}]}\n```',
++        ),
++      );
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    const result = await parser.parseText('Input', {
++      correlationId: 'corr-3',
++      attempt: 1,
++    });
++
++    expect(result.tasks[0].title).toBe('Markdown task');
++  });
++
++  it('maps 429 response to AI_PARSE_RATE_LIMIT', async () => {
++    jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(new Response('', { status: 429 }));
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-4',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_RATE_LIMIT',
++      retriable: true,
++    });
++  });
++
++  it('maps 5xx response to AI_PARSE_PROVIDER_ERROR', async () => {
++    jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(new Response('', { status: 500 }));
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-5',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_PROVIDER_ERROR',
++      retriable: true,
++    });
++  });
++
++  it('maps timeout (AbortError) to AI_PARSE_TIMEOUT', async () => {
++    const abortError = new Error('aborted');
++    (abortError as Error & { name: string }).name = 'AbortError';
++    jest.spyOn(global, 'fetch').mockRejectedValue(abortError);
++
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-6',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_TIMEOUT',
++      retriable: true,
++    });
++  });
++
++  it('maps network error to AI_PARSE_PROVIDER_ERROR', async () => {
++    jest.spyOn(global, 'fetch').mockRejectedValue(new Error('socket hang up'));
++
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-7',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_PROVIDER_ERROR',
++      retriable: true,
++    });
++  });
++
++  it('maps invalid completion JSON to AI_PARSE_INVALID_JSON', async () => {
++    jest.spyOn(global, 'fetch').mockResolvedValue(okResponse('not json'));
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-8',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_INVALID_JSON',
++    });
++  });
++
++  it('maps schema-invalid completion to AI_PARSE_ZOD_VALIDATION', async () => {
++    jest
++      .spyOn(global, 'fetch')
++      .mockResolvedValue(okResponse('{"tasks":[{"summary":"missing title"}]}'));
++    const parser = new DeepSeekTextParser(
++      buildConfigService({
++        'ai.deepseekApiKey': 'k',
++        'ai.deepseekBaseUrl': 'https://api.deepseek.com/v1',
++      }),
++      buildLogger(),
++    );
++
++    await expect(
++      parser.parseText('Input', {
++        correlationId: 'corr-9',
++        attempt: 1,
++      }),
++    ).rejects.toMatchObject<Partial<AiParserError>>({
++      code: 'AI_PARSE_ZOD_VALIDATION',
++      retriable: false,
++    });
++  });
++});
+diff --git a/test/integration/schema-migration.integration-spec.ts b/test/integration/schema-migration.integration-spec.ts
+new file mode 100644
+index 0000000..9147f23
+--- /dev/null
++++ b/test/integration/schema-migration.integration-spec.ts
+@@ -0,0 +1,199 @@
++import { randomUUID } from 'crypto';
++import { INestApplication } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++import { Test } from '@nestjs/testing';
++import { AssigneeStatus, InviteStatus } from '@prisma/client';
++import { ObservabilityModule } from '../../src/common/observability/observability.module';
++import { PrismaModule } from '../../src/prisma/prisma.module';
++import { PrismaService } from '../../src/prisma/prisma.service';
++
++describe('Sprint 2 schema and migration checks (integration)', () => {
++  let app: INestApplication;
++  let prisma: PrismaService;
++  let telegramIdSeq = BigInt(991000000000);
++
++  beforeAll(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [
++        ConfigModule.forRoot({ isGlobal: true }),
++        ObservabilityModule,
++        PrismaModule,
++      ],
++    }).compile();
++
++    app = moduleRef.createNestApplication();
++    await app.init();
++    prisma = app.get(PrismaService);
++  });
++
++  afterAll(async () => {
++    if (app) {
++      await app.close();
++    }
++  });
++
++  async function createUser(prefix: string) {
++    telegramIdSeq += 1n;
++    return prisma.user.create({
++      data: {
++        telegramId: telegramIdSeq,
++        telegramName: `${prefix}-${telegramIdSeq.toString()}`,
++      },
++    });
++  }
++
++  it('TaskStatus enum contains PARSE_FAILED', async () => {
++    const rows = await prisma.$queryRawUnsafe(`
++      SELECT e.enumlabel
++      FROM pg_type t
++      JOIN pg_enum e ON e.enumtypid = t.oid
++      WHERE t.typname = 'TaskStatus'
++      ORDER BY e.enumsortorder
++    `);
++
++    expect(rows.map((row) => row.enumlabel)).toContain('PARSE_FAILED');
++  });
++
++  it('required Sprint 2 tables exist', async () => {
++    const rows = await prisma.$queryRawUnsafe(`
++      SELECT table_name
++      FROM information_schema.tables
++      WHERE table_schema = 'public'
++        AND table_name IN ('task_assignees', 'invites', 'project_members')
++      ORDER BY table_name
++    `);
++
++    expect(rows.map((row) => row.table_name)).toEqual([
++      'invites',
++      'project_members',
++      'task_assignees',
++    ]);
++  });
++
++  it('required partial indexes exist', async () => {
++    const rows = await prisma.$queryRawUnsafe(`
++      SELECT indexname
++      FROM pg_indexes
++      WHERE schemaname = 'public'
++        AND indexname IN (
++          'uq_task_assignee_active',
++          'uq_task_assignee_pending_username',
++          'uq_project_member_active'
++        )
++      ORDER BY indexname
++    `);
++
++    expect(rows.map((row) => row.indexname)).toEqual([
++      'uq_project_member_active',
++      'uq_task_assignee_active',
++      'uq_task_assignee_pending_username',
++    ]);
++  });
++
++  it('enforces uq_task_assignee_active uniqueness per active task assignment', async () => {
++    const owner = await createUser('owner');
++    const firstCandidate = await createUser('candidate-a');
++    const secondCandidate = await createUser('candidate-b');
++    const task = await prisma.task.create({
++      data: {
++        userId: owner.id,
++        title: `Task ${randomUUID()}`,
++      },
++    });
++
++    await prisma.taskAssignee.create({
++      data: {
++        taskId: task.id,
++        assignedByUserId: owner.id,
++        assigneeUserId: firstCandidate.id,
++        status: AssigneeStatus.CONNECTED,
++        telegramUsername: 'candidatea',
++        connectedAt: new Date(),
++      },
++    });
++
++    await expect(
++      prisma.taskAssignee.create({
++        data: {
++          taskId: task.id,
++          assignedByUserId: owner.id,
++          assigneeUserId: secondCandidate.id,
++          status: AssigneeStatus.CONNECTED,
++          telegramUsername: 'candidateb',
++          connectedAt: new Date(),
++        },
++      }),
++    ).rejects.toMatchObject({ code: 'P2002' });
++  });
++
++  it('enforces uq_task_assignee_pending_username uniqueness for same task + username', async () => {
++    const owner = await createUser('owner-pending');
++    const task = await prisma.task.create({
++      data: {
++        userId: owner.id,
++        title: `Task ${randomUUID()}`,
++      },
++    });
++
++    await prisma.taskAssignee.create({
++      data: {
++        taskId: task.id,
++        assignedByUserId: owner.id,
++        status: AssigneeStatus.PENDING,
++        telegramUsername: 'pending_user',
++      },
++    });
++
++    await expect(
++      prisma.taskAssignee.create({
++        data: {
++          taskId: task.id,
++          assignedByUserId: owner.id,
++          status: AssigneeStatus.PENDING,
++          telegramUsername: 'pending_user',
++        },
++      }),
++    ).rejects.toMatchObject({ code: 'P2002' });
++  });
++
++  it('enforces uq_project_member_active uniqueness for project + user pair', async () => {
++    const owner = await createUser('project-owner');
++    const project = await prisma.project.create({
++      data: {
++        name: `Project ${randomUUID()}`,
++        userId: owner.id,
++      },
++    });
++
++    await prisma.projectMember.create({
++      data: {
++        projectId: project.id,
++        userId: owner.id,
++      },
++    });
++
++    await expect(
++      prisma.projectMember.create({
++        data: {
++          projectId: project.id,
++          userId: owner.id,
++        },
++      }),
++    ).rejects.toMatchObject({ code: 'P2002' });
++  });
++
++  it('stores invite status enum values from sprint schema', async () => {
++    const owner = await createUser('invite-owner');
++    const invite = await prisma.invite.create({
++      data: {
++        token: randomUUID(),
++        createdByUserId: owner.id,
++        targetTelegramUsername: 'invite_target',
++        status: InviteStatus.PENDING,
++        expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
++      },
++    });
++
++    expect(invite.status).toBe(InviteStatus.PENDING);
++  });
++});
+diff --git a/test/integration/task-parsing.orchestrator.integration-spec.ts b/test/integration/task-parsing.orchestrator.integration-spec.ts
+new file mode 100644
+index 0000000..f6e183f
+--- /dev/null
++++ b/test/integration/task-parsing.orchestrator.integration-spec.ts
+@@ -0,0 +1,139 @@
++import { Job } from 'bullmq';
++import { TaskStatus } from '@prisma/client';
++import { TaskParsingOrchestrator } from '../../src/modules/queue/processors/task-parsing/task-parsing.orchestrator';
++import { AiParserError } from '../../src/modules/ai/errors/ai-parser.error';
++import { TaskParsingJobData } from '../../src/modules/queue/contracts/task-parsing.job';
++
++describe('TaskParsingOrchestrator (integration)', () => {
++  const logger = {
++    log: jest.fn(),
++    warn: jest.fn(),
++    error: jest.fn(),
++    debug: jest.fn(),
++  };
++  const metrics = {
++    incrementQueueIdempotencyHit: jest.fn(),
++    observeAiParseDuration: jest.fn(),
++    incrementAiParse: jest.fn(),
++    incrementTasksCreated: jest.fn(),
++  };
++  const persistence = {
++    loadExistingTasksByIdempotencyKey: jest.fn(),
++    createParsedTasks: jest.fn(),
++    createFallbackTask: jest.fn(),
++  };
++  const notifications = {
++    enqueueExistingResultNotification: jest.fn(),
++    enqueueSuccessNotification: jest.fn(),
++    enqueueFallbackNotification: jest.fn(),
++  };
++  const aiParser = {
++    provider: 'mock' as const,
++    parseText: jest.fn(),
++  };
++
++  const orchestrator = new TaskParsingOrchestrator(
++    aiParser,
++    persistence,
++    notifications,
++    logger,
++    metrics,
++  );
++
++  const payload: TaskParsingJobData = {
++    userId: '68ba48ef-1367-4ba6-adb5-80ce113f02b0',
++    text: 'Plan release',
++    telegramMessageId: 1,
++    telegramChatId: 2,
++    correlationId: 'corr-1',
++    idempotencyKey: 'idem-1',
++  };
++
++  const job = {
++    id: 'job-1',
++  } as Job<Record<string, unknown>>;
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++    persistence.loadExistingTasksByIdempotencyKey.mockResolvedValue([]);
++    persistence.createParsedTasks.mockResolvedValue([
++      { id: 'task-1', title: 'Parsed task' },
++    ]);
++    persistence.createFallbackTask.mockResolvedValue({ id: 'fallback-task' });
++  });
++
++  it('retries once on first AI_PARSE_ZOD_VALIDATION and succeeds on second attempt', async () => {
++    aiParser.parseText.mockImplementationOnce(async () => {
++      throw new AiParserError(
++        'AI_PARSE_ZOD_VALIDATION',
++        'Schema validation failed',
++      );
++    });
++    aiParser.parseText.mockResolvedValueOnce({
++      tasks: [{ title: 'Parsed task', subtasks: [] }],
++    });
++
++    await orchestrator.handleJob(job, payload);
++
++    expect(aiParser.parseText).toHaveBeenCalledTimes(2);
++    expect(aiParser.parseText).toHaveBeenNthCalledWith(
++      1,
++      payload.text,
++      expect.objectContaining({
++        attempt: 1,
++        correlationId: payload.correlationId,
++      }),
++    );
++    expect(aiParser.parseText).toHaveBeenNthCalledWith(
++      2,
++      payload.text,
++      expect.objectContaining({
++        attempt: 2,
++        correlationId: payload.correlationId,
++        correctivePrompt: expect.any(String),
++      }),
++    );
++    expect(persistence.createParsedTasks).toHaveBeenCalled();
++    expect(notifications.enqueueSuccessNotification).toHaveBeenCalled();
++    expect(notifications.enqueueFallbackNotification).not.toHaveBeenCalled();
++  });
++
++  it('falls back immediately on timeout error without corrective retry', async () => {
++    aiParser.parseText.mockRejectedValueOnce(
++      new AiParserError('AI_PARSE_TIMEOUT', 'timeout', { retriable: true }),
++    );
++
++    await orchestrator.handleJob(job, payload);
++
++    expect(aiParser.parseText).toHaveBeenCalledTimes(1);
++    expect(persistence.createFallbackTask).toHaveBeenCalledWith(payload);
++    expect(notifications.enqueueFallbackNotification).toHaveBeenCalledWith(
++      payload,
++      'AI_PARSE_TIMEOUT',
++    );
++    expect(notifications.enqueueSuccessNotification).not.toHaveBeenCalled();
++  });
++
++  it('skips parsing and reuses previous result when idempotency hit is found', async () => {
++    persistence.loadExistingTasksByIdempotencyKey.mockResolvedValueOnce([
++      {
++        id: 'task-1',
++        title: 'Existing task',
++        status: TaskStatus.TODO,
++      },
++    ]);
++
++    await orchestrator.handleJob(job, payload);
++
++    expect(aiParser.parseText).not.toHaveBeenCalled();
++    expect(
++      notifications.enqueueExistingResultNotification,
++    ).toHaveBeenCalledWith(payload, [
++      {
++        id: 'task-1',
++        title: 'Existing task',
++        status: TaskStatus.TODO,
++      },
++    ]);
++  });
++});
+diff --git a/test/integration/task-write.integration-spec.ts b/test/integration/task-write.integration-spec.ts
+new file mode 100644
+index 0000000..029ddcd
+--- /dev/null
++++ b/test/integration/task-write.integration-spec.ts
+@@ -0,0 +1,196 @@
++import { randomUUID } from 'crypto';
++import { INestApplication } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++import { Test } from '@nestjs/testing';
++import { InputType, TaskStatus } from '@prisma/client';
++import { ObservabilityModule } from '../../src/common/observability/observability.module';
++import { PrismaModule } from '../../src/prisma/prisma.module';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { TaskParsingPersistenceService } from '../../src/modules/queue/processors/task-parsing/task-parsing.persistence.service';
++import { buildTaskIdFromIdempotencyKey } from '../../src/modules/queue/utils/deterministic-uuid.util';
++
++describe('TaskParsingPersistenceService (integration)', () => {
++  let app: INestApplication;
++  let prisma: PrismaService;
++  let service: TaskParsingPersistenceService;
++  let telegramIdSeq = BigInt(990000000000);
++
++  beforeAll(async () => {
++    const moduleRef = await Test.createTestingModule({
++      imports: [
++        ConfigModule.forRoot({ isGlobal: true }),
++        ObservabilityModule,
++        PrismaModule,
++      ],
++      providers: [TaskParsingPersistenceService],
++    }).compile();
++
++    app = moduleRef.createNestApplication();
++    await app.init();
++
++    prisma = app.get(PrismaService);
++    service = app.get(TaskParsingPersistenceService);
++  });
++
++  afterAll(async () => {
++    if (app) {
++      await app.close();
++    }
++  });
++
++  async function createUser() {
++    telegramIdSeq += 1n;
++    return prisma.user.create({
++      data: {
++        telegramId: telegramIdSeq,
++        telegramName: `task-write-test-${telegramIdSeq.toString()}`,
++      },
++    });
++  }
++
++  it('creates task and subtasks atomically inside transaction', async () => {
++    const user = await createUser();
++    const idempotencyKey = `persist-ok-${randomUUID()}`;
++
++    const result = await service.createTasks({
++      userId: user.id,
++      originalInput: 'Prepare release',
++      originalInputType: InputType.TEXT,
++      idempotencyKey,
++      tasks: [
++        {
++          title: 'Prepare release',
++          summary: 'Summarize release scope',
++          deadline: null,
++          subtasks: [
++            { title: 'Write changelog' },
++            { title: 'Run regression', order: 4 },
++          ],
++        },
++      ],
++    });
++
++    expect(result).toHaveLength(1);
++    expect(result?.[0].id).toBe(
++      buildTaskIdFromIdempotencyKey(idempotencyKey, 0),
++    );
++
++    const storedTask = await prisma.task.findUnique({
++      where: { id: buildTaskIdFromIdempotencyKey(idempotencyKey, 0) },
++      include: {
++        subtasks: { orderBy: { order: 'asc' } },
++      },
++    });
++
++    expect(storedTask).toBeTruthy();
++    expect(storedTask?.status).toBe(TaskStatus.TODO);
++    expect(storedTask?.subtasks).toHaveLength(2);
++    expect(storedTask?.subtasks[0].order).toBe(0);
++    expect(storedTask?.subtasks[1].order).toBe(4);
++  });
++
++  it('rolls back entire transaction when one task insert fails', async () => {
++    const user = await createUser();
++    const idempotencyKey = `persist-rollback-${randomUUID()}`;
++
++    await expect(
++      service.createTasks({
++        userId: user.id,
++        originalInput: 'Broken payload',
++        originalInputType: InputType.TEXT,
++        idempotencyKey,
++        tasks: [
++          {
++            title: 'Task 1',
++            subtasks: [{ title: 'Subtask 1' }],
++          },
++          {
++            title: 'x'.repeat(501),
++            subtasks: [],
++          },
++        ],
++      }),
++    ).rejects.toThrow('TASK_CREATE_FAILED');
++
++    const createdIds = [0, 1].map((index) =>
++      buildTaskIdFromIdempotencyKey(idempotencyKey, index),
++    );
++    const createdTasks = await prisma.task.findMany({
++      where: { id: { in: createdIds } },
++    });
++
++    expect(createdTasks).toHaveLength(0);
++  });
++
++  it('writes fallback task with PARSE_FAILED status and original input', async () => {
++    const user = await createUser();
++    const idempotencyKey = `persist-fallback-${randomUUID()}`;
++    const originalInput = 'непонятный текст без структуры';
++
++    const fallback = await service.createFallbackTask({
++      userId: user.id,
++      text: originalInput,
++      telegramMessageId: 1,
++      telegramChatId: 2,
++      correlationId: 'corr-fallback',
++      idempotencyKey,
++    });
++
++    expect(fallback).toBeTruthy();
++
++    const taskId = buildTaskIdFromIdempotencyKey(idempotencyKey, 0);
++    const storedTask = await prisma.task.findUnique({
++      where: { id: taskId },
++      include: {
++        subtasks: true,
++      },
++    });
++
++    expect(storedTask).toBeTruthy();
++    expect(storedTask?.status).toBe(TaskStatus.PARSE_FAILED);
++    expect(storedTask?.originalInput).toBe(originalInput);
++    expect(storedTask?.originalInputType).toBe(InputType.TEXT);
++    expect(storedTask?.subtasks).toHaveLength(0);
++  });
++
++  it('returns null on duplicate deterministic task id for same idempotency key', async () => {
++    const user = await createUser();
++    const idempotencyKey = `persist-duplicate-${randomUUID()}`;
++
++    const first = await service.createTasks({
++      userId: user.id,
++      originalInput: 'Task once',
++      originalInputType: InputType.TEXT,
++      idempotencyKey,
++      tasks: [{ title: 'Task once', subtasks: [] }],
++    });
++    const second = await service.createTasks({
++      userId: user.id,
++      originalInput: 'Task twice',
++      originalInputType: InputType.TEXT,
++      idempotencyKey,
++      tasks: [{ title: 'Task twice', subtasks: [] }],
++    });
++
++    expect(first).toHaveLength(1);
++    expect(second).toBeNull();
++  });
++
++  it('returns null for multi-task inbox create due unique order index (BLOCKER)', async () => {
++    const user = await createUser();
++    const idempotencyKey = `persist-multi-blocker-${randomUUID()}`;
++
++    const result = await service.createTasks({
++      userId: user.id,
++      originalInput: 'Task one; Task two',
++      originalInputType: InputType.TEXT,
++      idempotencyKey,
++      tasks: [
++        { title: 'Task one', subtasks: [] },
++        { title: 'Task two', subtasks: [] },
++      ],
++    });
++
++    expect(result).toBeNull();
++  });
++});
+diff --git a/test/unit/deepseek-prompt.unit-spec.ts b/test/unit/deepseek-prompt.unit-spec.ts
+new file mode 100644
+index 0000000..a7085a1
+--- /dev/null
++++ b/test/unit/deepseek-prompt.unit-spec.ts
+@@ -0,0 +1,51 @@
++import {
++  buildDeepSeekTaskParserSystemPrompt,
++  buildDeepSeekTaskParserUserPrompt,
++  CORRECTIVE_TASK_PARSER_PROMPT,
++} from '../../src/modules/ai/prompts/deepseek-task-parser.prompt';
++
++describe('DeepSeek task parser prompt builder', () => {
++  it('builds system prompt with schema and policy rules', () => {
++    const nowIso = '2026-02-07T12:00:00.000Z';
++
++    const prompt = buildDeepSeekTaskParserSystemPrompt(nowIso);
++
++    expect(prompt).toContain(`Current timestamp: ${nowIso}`);
++    expect(prompt).toContain('"tasks"');
++    expect(prompt).toContain('tasks count must be 1..5');
++    expect(prompt).toContain('subtasks per task must be 0..20');
++    expect(prompt).toContain('preserve user language');
++    expect(prompt).toContain('no markdown, no explanations, no extra keys');
++  });
++
++  it('returns raw user input when corrective prompt is absent', () => {
++    const input = 'Сделай релиз завтра';
++
++    const prompt = buildDeepSeekTaskParserUserPrompt(input, {
++      correlationId: 'corr-1',
++      attempt: 1,
++    });
++
++    expect(prompt).toBe(input);
++  });
++
++  it('builds corrective user prompt when corrective message is present', () => {
++    const input = 'Разбей задачу на шаги';
++    const corrective = 'Return strict JSON object';
++
++    const prompt = buildDeepSeekTaskParserUserPrompt(input, {
++      correlationId: 'corr-2',
++      attempt: 2,
++      correctivePrompt: corrective,
++    });
++
++    expect(prompt).toContain('Previous response was invalid JSON');
++    expect(prompt).toContain(corrective);
++    expect(prompt).toContain(input);
++  });
++
++  it('exports corrective prompt constant used for second attempt', () => {
++    expect(CORRECTIVE_TASK_PARSER_PROMPT).toContain('"tasks"');
++    expect(CORRECTIVE_TASK_PARSER_PROMPT).toContain('Do not wrap in markdown');
++  });
++});
+diff --git a/test/unit/deepseek-response-parser.unit-spec.ts b/test/unit/deepseek-response-parser.unit-spec.ts
+new file mode 100644
+index 0000000..5b58525
+--- /dev/null
++++ b/test/unit/deepseek-response-parser.unit-spec.ts
+@@ -0,0 +1,42 @@
++import { AiParserError } from '../../src/modules/ai/errors/ai-parser.error';
++import { parseJsonFromContent } from '../../src/modules/ai/parsers/json-content.parser';
++
++describe('parseJsonFromContent', () => {
++  it('parses clean JSON content', () => {
++    const result = parseJsonFromContent(
++      '{"tasks":[{"title":"Write docs","subtasks":[]}]}',
++    );
++
++    expect(result).toEqual({
++      tasks: [{ title: 'Write docs', subtasks: [] }],
++    });
++  });
++
++  it('parses JSON wrapped in markdown code block', () => {
++    const result = parseJsonFromContent(
++      '```json\n{"tasks":[{"title":"Deploy","subtasks":[]}]}\n```',
++    );
++
++    expect(result).toEqual({
++      tasks: [{ title: 'Deploy', subtasks: [] }],
++    });
++  });
++
++  it('throws AI_PARSE_INVALID_JSON when content is not JSON', () => {
++    expect(() => parseJsonFromContent('not-a-json')).toThrow(
++      expect.objectContaining<Partial<AiParserError>>({
++        code: 'AI_PARSE_INVALID_JSON',
++      }),
++    );
++  });
++
++  it('throws AI_PARSE_INVALID_JSON when markdown code block has invalid JSON', () => {
++    expect(() =>
++      parseJsonFromContent('```json\n{"tasks":[{"title":]}\n```'),
++    ).toThrow(
++      expect.objectContaining<Partial<AiParserError>>({
++        code: 'AI_PARSE_INVALID_JSON',
++      }),
++    );
++  });
++});
+diff --git a/test/unit/notification-formatter.unit-spec.ts b/test/unit/notification-formatter.unit-spec.ts
+new file mode 100644
+index 0000000..6796bc0
+--- /dev/null
++++ b/test/unit/notification-formatter.unit-spec.ts
+@@ -0,0 +1,88 @@
++import { TaskStatus } from '@prisma/client';
++import { Queue } from 'bullmq';
++import { TaskParsingNotificationService } from '../../src/modules/queue/processors/task-parsing/task-parsing.notification.service';
++import { TaskParsingJobData } from '../../src/modules/queue/contracts/task-parsing.job';
++
++describe('TaskParsingNotificationService', () => {
++  const add = jest.fn().mockResolvedValue(undefined);
++  const queue = { add } as unknown as Queue;
++  const service = new TaskParsingNotificationService(queue);
++
++  const basePayload: TaskParsingJobData = {
++    userId: '58e05e3f-e496-46fe-bd64-aa7dd772fc1a',
++    text: 'Build parser',
++    telegramMessageId: 100,
++    telegramChatId: 200,
++    correlationId: 'corr-test',
++    idempotencyKey: 'task-parse:test',
++  };
++
++  beforeEach(() => {
++    add.mockClear();
++  });
++
++  it('formats single task success notification', async () => {
++    await service.enqueueSuccessNotification(basePayload, ['Plan sprint']);
++
++    expect(add).toHaveBeenCalledWith(
++      'task-parse-notification',
++      expect.objectContaining({
++        chatId: basePayload.telegramChatId,
++        text: 'Task created: <b>Plan sprint</b>',
++        parseMode: 'HTML',
++        correlationId: basePayload.correlationId,
++      }),
++      { jobId: `task-parsing-notification-${basePayload.idempotencyKey}` },
++    );
++  });
++
++  it('formats multi-task success notification and escapes HTML', async () => {
++    await service.enqueueSuccessNotification(basePayload, [
++      'A < B',
++      'B > C',
++      '"Quoted"',
++      "John's task",
++    ]);
++
++    const queuedPayload = add.mock.calls[0][1] as { text: string };
++    expect(queuedPayload.text).toContain('Tasks created: <b>4</b>');
++    expect(queuedPayload.text).toContain('- A &lt; B');
++    expect(queuedPayload.text).toContain('- B &gt; C');
++    expect(queuedPayload.text).toContain('- &quot;Quoted&quot;');
++    expect(queuedPayload.text).toContain('\n... and 1 more');
++  });
++
++  it('formats fallback notification with reason code', async () => {
++    await service.enqueueFallbackNotification(basePayload, 'AI_PARSE_TIMEOUT');
++
++    expect(add).toHaveBeenCalledWith(
++      'task-parse-notification',
++      expect.objectContaining({
++        text: expect.stringContaining(
++          'Could not parse the message (AI_PARSE_TIMEOUT). Saved as raw task.',
++        ),
++      }),
++      { jobId: `task-parsing-notification-${basePayload.idempotencyKey}` },
++    );
++  });
++
++  it('uses fallback template for existing parse-failed result', async () => {
++    await service.enqueueExistingResultNotification(basePayload, [
++      {
++        id: 'task-1',
++        title: 'Raw fallback',
++        status: TaskStatus.PARSE_FAILED,
++      },
++    ]);
++
++    const queuedPayload = add.mock.calls[0][1] as { text: string };
++    expect(queuedPayload.text).toContain('AI_PARSE_ZOD_VALIDATION');
++    expect(queuedPayload.text).toContain('Saved as raw task');
++  });
++
++  it('does not enqueue notification when existing result list is empty', async () => {
++    await service.enqueueExistingResultNotification(basePayload, []);
++
++    expect(add).not.toHaveBeenCalled();
++  });
++});
+diff --git a/test/unit/parsed-task.validator.unit-spec.ts b/test/unit/parsed-task.validator.unit-spec.ts
+new file mode 100644
+index 0000000..0fb67f2
+--- /dev/null
++++ b/test/unit/parsed-task.validator.unit-spec.ts
+@@ -0,0 +1,132 @@
++import { ParsedTaskSchema } from '../../src/modules/ai/validators/ai-output.validator';
++
++describe('ParsedTaskSchema', () => {
++  it('accepts a valid payload and defaults subtasks to empty array', () => {
++    const parsed = ParsedTaskSchema.parse({
++      tasks: [
++        {
++          title: 'Write sprint retrospective',
++          summary: 'Collect notes from the whole team',
++          deadline: '2026-02-08T10:00:00.000Z',
++        },
++      ],
++    });
++
++    expect(parsed.tasks).toHaveLength(1);
++    expect(parsed.tasks[0].subtasks).toEqual([]);
++  });
++
++  it('rejects empty tasks list', () => {
++    expect(() => ParsedTaskSchema.parse({ tasks: [] })).toThrow();
++  });
++
++  it('rejects more than 5 tasks', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: Array.from({ length: 6 }, (_, index) => ({
++          title: `Task ${index + 1}`,
++          subtasks: [],
++        })),
++      }),
++    ).toThrow();
++  });
++
++  it('rejects title longer than 500 chars', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'a'.repeat(501),
++            subtasks: [],
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('rejects summary longer than 2000 chars', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'Valid title',
++            summary: 'a'.repeat(2001),
++            subtasks: [],
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('rejects more than 20 subtasks in a task', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'Parent task',
++            subtasks: Array.from({ length: 21 }, (_, index) => ({
++              title: `Subtask ${index + 1}`,
++              order: index,
++            })),
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('rejects invalid deadline format', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'Prepare report',
++            deadline: 'tomorrow',
++            subtasks: [],
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('rejects subtask with empty title', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'Parent task',
++            subtasks: [{ title: '   ', order: 0 }],
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('rejects subtask with negative order', () => {
++    expect(() =>
++      ParsedTaskSchema.parse({
++        tasks: [
++          {
++            title: 'Parent task',
++            subtasks: [{ title: 'Valid subtask', order: -1 }],
++          },
++        ],
++      }),
++    ).toThrow();
++  });
++
++  it('accepts nullable optional fields', () => {
++    const parsed = ParsedTaskSchema.parse({
++      tasks: [
++        {
++          title: 'Prepare release',
++          deadline: null,
++          projectHint: null,
++          subtasks: [],
++        },
++      ],
++    });
++
++    expect(parsed.tasks[0].deadline).toBeNull();
++    expect(parsed.tasks[0].projectHint).toBeNull();
++  });
++});

@@ -1,33 +1,34 @@
 import { z } from 'zod';
 
-// Схема одной задачи (вспомогательная)
+const IsoDateTimeSchema = z
+  .string()
+  .refine((value) => !Number.isNaN(Date.parse(value)), {
+    message: 'Deadline must be a valid ISO 8601 date string',
+  });
+
 export const SingleTaskSchema = z.object({
-  title: z.string().describe('Clear action title'),
-  deadline: z.string().datetime().nullable().describe('ISO 8601 date or null'),
-  priority: z.enum(['LOW', 'MEDIUM', 'HIGH']).default('MEDIUM'),
-  summary: z.string().optional().describe('Markdown description'),
+  title: z.string().trim().min(1).max(500),
+  deadline: IsoDateTimeSchema.nullable().optional(),
+  summary: z.string().trim().max(2000).optional(),
+  projectHint: z.string().trim().max(255).nullable().optional(),
   subtasks: z
     .array(
       z.object({
-        title: z.string().describe('Concise subtask title'),
-        order: z.number().int().optional(),
+        title: z.string().trim().min(1).max(500),
+        order: z.number().int().nonnegative().optional(),
       }),
     )
-    .max(10)
-    .describe('List of steps/checklist'),
+    .max(20)
+    .default([]),
 });
 
-// Основная схема ответа (Экспортируем её)
 export const ParsedTaskSchema = z.object({
-  // Массив задач!
-  tasks: z.array(SingleTaskSchema).describe('List of detected distinct tasks'),
-  isIgnored: z.boolean().default(false).describe('True if input is garbage'),
+  tasks: z.array(SingleTaskSchema).min(1).max(5),
 });
 
 export type ParsedTask = z.infer<typeof ParsedTaskSchema>;
 export type SingleTask = z.infer<typeof SingleTaskSchema>;
 
-// Остальные схемы (MutationResult) оставь как были
 export const MutationResultSchema = z.object({
   newSummary: z.string(),
   subtasks: z.array(
@@ -38,4 +39,5 @@ export const MutationResultSchema = z.object({
     }),
   ),
 });
+
 export type MutationResult = z.infer<typeof MutationResultSchema>;

@@ -5,13 +5,14 @@ import {
   Injectable,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { createHash } from 'crypto';
 import { PinoLoggerService } from '../../common/logger/pino-logger.service';
 import { UserService } from '../user/user.service';
 import { TelegramQueueProducerService } from './telegram-queue-producer.service';
 import {
-  isTelegramUpdate,
   parseTelegramCommand,
   TelegramMessage,
+  TelegramUpdateSubsetSchema,
   TelegramUpdate,
 } from './telegram.update';
 
@@ -49,7 +50,7 @@ export class TelegramWebhookService {
       return { ok: true };
     }
 
-    await this.userService.upsertTelegramUser({
+    const user = await this.userService.upsertTelegramUser({
       telegramId: context.telegramUserId,
       username: context.message.from?.username,
       firstName: context.message.from?.first_name,
@@ -81,11 +82,16 @@ export class TelegramWebhookService {
 
       await this.queueProducer.enqueueTaskParsing({
         telegramUpdateId: context.update.update_id,
-        telegramUserId: context.telegramUserId,
+        userId: user.id,
         telegramChatId: context.telegramChatId,
         telegramMessageId: context.message.message_id,
         text: context.message.text,
         correlationId,
+        idempotencyKey: this.buildTaskParsingIdempotencyKey(
+          context.telegramChatId,
+          context.message.message_id,
+          context.message.text,
+        ),
       });
 
       this.logger.log({
@@ -137,7 +143,8 @@ export class TelegramWebhookService {
   }
 
   private validateAndNormalizeUpdate(rawUpdate: unknown): TelegramUpdate {
-    if (!isTelegramUpdate(rawUpdate)) {
+    const parsed = TelegramUpdateSubsetSchema.safeParse(rawUpdate);
+    if (!parsed.success) {
       throw new HttpException(
         {
           code: 'TELEGRAM_INVALID_PAYLOAD',
@@ -146,27 +153,7 @@ export class TelegramWebhookService {
         HttpStatus.BAD_REQUEST,
       );
     }
-
-    if (!rawUpdate.message) {
-      return rawUpdate;
-    }
-
-    const message = rawUpdate.message;
-    const hasMessageId = typeof message.message_id === 'number';
-    const hasFromId = typeof message.from?.id === 'number';
-    const hasChatId = typeof message.chat?.id === 'number';
-
-    if (!hasMessageId || !hasFromId || !hasChatId) {
-      throw new HttpException(
-        {
-          code: 'TELEGRAM_INVALID_PAYLOAD',
-          message: 'Malformed Telegram message payload',
-        },
-        HttpStatus.BAD_REQUEST,
-      );
-    }
-
-    return rawUpdate;
+    return parsed.data;
   }
 
   private extractMessageContext(
@@ -184,5 +171,18 @@ export class TelegramWebhookService {
       telegramUserId: message.from.id,
       telegramChatId: message.chat.id,
     };
+  }
+
+  private buildTaskParsingIdempotencyKey(
+    chatId: number,
+    messageId: number,
+    text: string,
+  ): string {
+    const normalizedText = text.trim().replace(/\s+/g, ' ');
+    const contentHash = createHash('sha256')
+      .update(`${chatId}:${messageId}:${normalizedText}`)
+      .digest('hex');
+
+    return `task-parse:${chatId}:${messageId}:${contentHash.slice(0, 24)}`;
   }
 }

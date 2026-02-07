@@ -95,14 +95,25 @@ describe('TelegramWebhookService', () => {
       firstName: undefined,
       lastName: undefined,
     });
-    expect(queueProducer.enqueueTaskParsing).toHaveBeenCalledWith({
-      telegramUpdateId: 1001,
-      telegramUserId: 2001,
-      telegramChatId: 3001,
-      telegramMessageId: 77,
-      text: 'Buy milk tomorrow',
-      correlationId,
-    });
+    expect(queueProducer.enqueueTaskParsing).toHaveBeenCalledTimes(1);
+    const [taskPayload] = queueProducer.enqueueTaskParsing.mock.calls[0] as [
+      {
+        telegramUpdateId: number;
+        userId: string;
+        telegramChatId: number;
+        telegramMessageId: number;
+        text: string;
+        correlationId: string;
+        idempotencyKey: string;
+      },
+    ];
+    expect(taskPayload.telegramUpdateId).toBe(1001);
+    expect(taskPayload.userId).toBe('user-id');
+    expect(taskPayload.telegramChatId).toBe(3001);
+    expect(taskPayload.telegramMessageId).toBe(77);
+    expect(taskPayload.text).toBe('Buy milk tomorrow');
+    expect(taskPayload.correlationId).toBe(correlationId);
+    expect(taskPayload.idempotencyKey).toMatch(/^task-parse:/);
     expect(queueProducer.enqueueCommand).not.toHaveBeenCalled();
     expect(queueProducer.enqueueVoiceTranscription).not.toHaveBeenCalled();
   });

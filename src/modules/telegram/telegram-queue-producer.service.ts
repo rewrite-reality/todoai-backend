@@ -1,6 +1,7 @@
 import { InjectQueue } from '@nestjs/bullmq';
 import { Injectable } from '@nestjs/common';
 import { Queue } from 'bullmq';
+import type { TaskParsingJobData } from '../queue/contracts/task-parsing.job';
 import { QUEUES } from '../queue/queues.config';
 import { SupportedTelegramCommand } from './telegram.update';
 
@@ -11,9 +12,14 @@ export interface BaseTelegramJobPayload {
   correlationId: string;
 }
 
-export interface TelegramTaskParsingJobPayload extends BaseTelegramJobPayload {
+export interface TelegramTaskParsingJobPayload {
+  telegramUpdateId: number;
+  userId: string;
+  telegramChatId: number;
   telegramMessageId: number;
   text: string;
+  correlationId: string;
+  idempotencyKey: string;
 }
 
 export interface TelegramVoiceJobPayload extends BaseTelegramJobPayload {
@@ -87,9 +93,25 @@ export class TelegramQueueProducerService {
   async enqueueTaskParsing(
     payload: TelegramTaskParsingJobPayload,
   ): Promise<void> {
-    await this.taskParsingQueue.add('parse-task', payload, {
-      jobId: this.buildJobId(payload.telegramUpdateId),
-    });
+    const taskParsingPayload: TaskParsingJobData = {
+      userId: payload.userId,
+      text: payload.text,
+      telegramMessageId: payload.telegramMessageId,
+      telegramChatId: payload.telegramChatId,
+      correlationId: payload.correlationId,
+      idempotencyKey: payload.idempotencyKey,
+    };
+
+    await this.taskParsingQueue.add(
+      'parse-task',
+      {
+        telegramUpdateId: payload.telegramUpdateId,
+        ...taskParsingPayload,
+      },
+      {
+        jobId: this.buildJobId(payload.telegramUpdateId),
+      },
+    );
   }
 
   async enqueueVoiceTranscription(

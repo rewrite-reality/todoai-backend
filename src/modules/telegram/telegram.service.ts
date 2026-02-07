@@ -31,10 +31,16 @@ export class TelegramService implements OnModuleInit {
   }
 
   async setWebhook() {
-    const url = `https://api.telegram.org/bot${this.botToken}/setWebhook?url=${this.webhookUrl}&secret_token=${this.webhookSecret}`;
+    const webhookEndpoint = new URL(
+      `https://api.telegram.org/bot${this.botToken}/setWebhook`,
+    );
+    webhookEndpoint.search = new URLSearchParams({
+      url: this.webhookUrl,
+      secret_token: this.webhookSecret,
+    }).toString();
 
     try {
-      const response = await fetch(url);
+      const response = await fetch(webhookEndpoint);
       const data: unknown = await response.json();
 
       if (this.isTelegramApiResponse(data) && data.ok) {
@@ -54,14 +60,23 @@ export class TelegramService implements OnModuleInit {
     const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
 
     try {
-      await fetch(url, {
+      const response = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text }),
       });
+
+      if (!response.ok) {
+        const body = await response.text();
+        this.logger.error(
+          `Telegram sendMessage failed for ${chatId}: ${response.status} ${body}`,
+        );
+        throw new Error('TELEGRAM_SEND_MESSAGE_FAILED');
+      }
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Failed to send message to ${chatId}: ${message}`);
+      throw new Error('TELEGRAM_SEND_MESSAGE_FAILED');
     }
   }
 

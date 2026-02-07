@@ -38,11 +38,12 @@ describe('TelegramQueueProducerService (integration)', () => {
   it('deduplicates jobs by update_id through BullMQ jobId', async () => {
     const payload = {
       telegramUpdateId: 9001,
-      telegramUserId: 10001,
+      userId: 'ab4a1f59-a3a3-4380-8edb-9e34dc413a2f',
       telegramChatId: 11001,
       telegramMessageId: 12001,
       text: 'First text',
       correlationId: 'integration-corr-1',
+      idempotencyKey: 'task-parse:test-key',
     };
 
     await producer.enqueueTaskParsing(payload);

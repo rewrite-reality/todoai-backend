@@ -1,0 +1,953 @@
+diff --git a/.env.example b/.env.example
+index 81f1de0..fd17e4e 100644
+--- a/.env.example
++++ b/.env.example
+@@ -28,6 +28,11 @@ NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=your_bot_username
+ 
+ # OpenAI
+ OPENAI_API_KEY=your_openai_api_key_here
++AI_TEXT_PROVIDER=mock
++DEEPSEEK_API_KEY=your_deepseek_api_key_here
++DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
++DEEPSEEK_MODEL=deepseek-chat
++AI_TIMEOUT_MS=30000
+ 
+ # Auth
+ JWT_SECRET=your_jwt_secret_here_change_in_production
+diff --git a/.env.test b/.env.test
+index 0d0bfe5..a62458a 100644
+--- a/.env.test
++++ b/.env.test
+@@ -26,3 +26,7 @@ JWT_SECRET=test-jwt-secret
+ JWT_EXPIRES_IN=1h
+ INIT_DATA_MAX_AGE_SECONDS=300
+ ENCRYPTION_KEY=0123456789abcdef0123456789abcdef
++AI_TEXT_PROVIDER=mock
++DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
++DEEPSEEK_MODEL=deepseek-chat
++AI_TIMEOUT_MS=30000
+diff --git a/src/common/metrics/metrics.service.ts b/src/common/metrics/metrics.service.ts
+index 0a0a6a2..d2e2a9a 100644
+--- a/src/common/metrics/metrics.service.ts
++++ b/src/common/metrics/metrics.service.ts
+@@ -1,6 +1,9 @@
+ import { Injectable } from '@nestjs/common';
+ 
+ type HealthStatusLabel = 'ok' | 'degraded';
++type ParseResultLabel = 'success' | 'fallback' | 'error';
++type ParseProviderLabel = 'mock' | 'deepseek';
++type TaskSourceLabel = 'ai' | 'fallback';
+ 
+ @Injectable()
+ export class MetricsService {
+@@ -8,6 +11,16 @@ export class MetricsService {
+     ok: 0,
+     degraded: 0,
+   };
++  private readonly aiParseCounter: Record<string, number> = {};
++  private readonly aiParseDurationMs: Record<ParseProviderLabel, number[]> = {
++    mock: [],
++    deepseek: [],
++  };
++  private readonly tasksCreatedCounter: Record<TaskSourceLabel, number> = {
++    ai: 0,
++    fallback: 0,
++  };
++  private readonly queueIdempotencyHits: Record<string, number> = {};
+ 
+   incrementHealth(status: HealthStatusLabel) {
+     this.healthCounter[status] += 1;
+@@ -16,4 +29,22 @@ export class MetricsService {
+   getHealthCounts() {
+     return { ...this.healthCounter };
+   }
++
++  incrementAiParse(result: ParseResultLabel, provider: ParseProviderLabel) {
++    const key = `${result}:${provider}`;
++    this.aiParseCounter[key] = (this.aiParseCounter[key] ?? 0) + 1;
++  }
++
++  observeAiParseDuration(provider: ParseProviderLabel, durationMs: number) {
++    this.aiParseDurationMs[provider].push(durationMs);
++  }
++
++  incrementTasksCreated(source: TaskSourceLabel, count: number) {
++    this.tasksCreatedCounter[source] += count;
++  }
++
++  incrementQueueIdempotencyHit(queue: string) {
++    this.queueIdempotencyHits[queue] =
++      (this.queueIdempotencyHits[queue] ?? 0) + 1;
++  }
+ }
+diff --git a/src/config/configuration.ts b/src/config/configuration.ts
+index 123529b..7e0c6d2 100644
+--- a/src/config/configuration.ts
++++ b/src/config/configuration.ts
+@@ -17,5 +17,12 @@ export default () => {
+     jwtExpiresIn: envVars.JWT_EXPIRES_IN,
+     initDataMaxAgeSeconds: envVars.INIT_DATA_MAX_AGE_SECONDS,
+     encryptionKey: envVars.ENCRYPTION_KEY,
++    ai: {
++      textProvider: envVars.AI_TEXT_PROVIDER,
++      deepseekApiKey: envVars.DEEPSEEK_API_KEY,
++      deepseekBaseUrl: envVars.DEEPSEEK_BASE_URL,
++      deepseekModel: envVars.DEEPSEEK_MODEL,
++      timeoutMs: envVars.AI_TIMEOUT_MS,
++    },
+   };
+ };
+diff --git a/src/config/validation.schema.ts b/src/config/validation.schema.ts
+index 4c77e81..33ddca2 100644
+--- a/src/config/validation.schema.ts
++++ b/src/config/validation.schema.ts
+@@ -16,6 +16,21 @@ export const EnvironmentSchema = z.object({
+   ENCRYPTION_KEY: z
+     .string()
+     .length(32, 'ENCRYPTION_KEY must be 32 bytes long for AES-256-GCM'),
++  AI_TEXT_PROVIDER: z.enum(['mock', 'deepseek']).default('mock'),
++  DEEPSEEK_API_KEY: z.string().min(1).optional(),
++  DEEPSEEK_BASE_URL: z.string().url().default('https://api.deepseek.com/v1'),
++  DEEPSEEK_MODEL: z.string().min(1).default('deepseek-chat'),
++  AI_TIMEOUT_MS: z
++    .preprocess((val) => Number(val), z.number().int().positive())
++    .default(30000),
++}).superRefine((env, ctx) => {
++  if (env.AI_TEXT_PROVIDER === 'deepseek' && !env.DEEPSEEK_API_KEY) {
++    ctx.addIssue({
++      code: z.ZodIssueCode.custom,
++      path: ['DEEPSEEK_API_KEY'],
++      message: 'DEEPSEEK_API_KEY is required when AI_TEXT_PROVIDER=deepseek',
++    });
++  }
+ });
+ 
+ export type EnvironmentVariables = z.infer<typeof EnvironmentSchema>;
+diff --git a/src/modules/ai/ai.module.ts b/src/modules/ai/ai.module.ts
+index decb754..d1e8fc9 100644
+--- a/src/modules/ai/ai.module.ts
++++ b/src/modules/ai/ai.module.ts
+@@ -1,10 +1,29 @@
+ import { Module } from '@nestjs/common';
+-import { ConfigModule } from '@nestjs/config';
+-import { AiService } from './ai.service';
++import { ConfigModule, ConfigService } from '@nestjs/config';
++import { AI_TEXT_PARSER } from './constants/ai.tokens';
++import { DeepSeekTextParser } from './providers/deepseek-text.parser';
++import { MockAiParser } from './providers/mock-ai.parser';
+ 
+ @Module({
+   imports: [ConfigModule],
+-  providers: [AiService],
+-  exports: [AiService],
++  providers: [
++    MockAiParser,
++    DeepSeekTextParser,
++    {
++      provide: AI_TEXT_PARSER,
++      inject: [ConfigService, MockAiParser, DeepSeekTextParser],
++      useFactory: (
++        configService: ConfigService,
++        mockParser: MockAiParser,
++        deepSeekParser: DeepSeekTextParser,
++      ) => {
++        const provider =
++          configService.get<'mock' | 'deepseek'>('AI_TEXT_PROVIDER') ?? 'mock';
++
++        return provider === 'deepseek' ? deepSeekParser : mockParser;
++      },
++    },
++  ],
++  exports: [AI_TEXT_PARSER],
+ })
+ export class AiModule {}
+diff --git a/src/modules/ai/ai.service.ts b/src/modules/ai/ai.service.ts
+index b4a112c..1e1ee3c 100644
+--- a/src/modules/ai/ai.service.ts
++++ b/src/modules/ai/ai.service.ts
+@@ -79,14 +79,12 @@ export class AiService {
+       const isTruncated = normalizedInput.length > 100;
+ 
+       const fallback: ParsedTask = {
+-        isIgnored: false,
+         tasks: [
+           {
+             title: title || 'Untitled task',
+             deadline: null,
+             summary: isTruncated ? normalizedInput : undefined,
+             subtasks: [],
+-            priority: 'MEDIUM',
+           },
+         ],
+       };
+diff --git a/src/modules/ai/validators/ai-output.validator.ts b/src/modules/ai/validators/ai-output.validator.ts
+index 3a52875..00f02d0 100644
+--- a/src/modules/ai/validators/ai-output.validator.ts
++++ b/src/modules/ai/validators/ai-output.validator.ts
+@@ -1,33 +1,34 @@
+ import { z } from 'zod';
+ 
+-// Схема одной задачи (вспомогательная)
++const IsoDateTimeSchema = z
++  .string()
++  .refine((value) => !Number.isNaN(Date.parse(value)), {
++    message: 'Deadline must be a valid ISO 8601 date string',
++  });
++
+ export const SingleTaskSchema = z.object({
+-  title: z.string().describe('Clear action title'),
+-  deadline: z.string().datetime().nullable().describe('ISO 8601 date or null'),
+-  priority: z.enum(['LOW', 'MEDIUM', 'HIGH']).default('MEDIUM'),
+-  summary: z.string().optional().describe('Markdown description'),
++  title: z.string().trim().min(1).max(500),
++  deadline: IsoDateTimeSchema.nullable().optional(),
++  summary: z.string().trim().max(2000).optional(),
++  projectHint: z.string().trim().max(255).nullable().optional(),
+   subtasks: z
+     .array(
+       z.object({
+-        title: z.string().describe('Concise subtask title'),
+-        order: z.number().int().optional(),
++        title: z.string().trim().min(1).max(500),
++        order: z.number().int().nonnegative().optional(),
+       }),
+     )
+-    .max(10)
+-    .describe('List of steps/checklist'),
++    .max(20)
++    .default([]),
+ });
+ 
+-// Основная схема ответа (Экспортируем её)
+ export const ParsedTaskSchema = z.object({
+-  // Массив задач!
+-  tasks: z.array(SingleTaskSchema).describe('List of detected distinct tasks'),
+-  isIgnored: z.boolean().default(false).describe('True if input is garbage'),
++  tasks: z.array(SingleTaskSchema).min(1).max(5),
+ });
+ 
+ export type ParsedTask = z.infer<typeof ParsedTaskSchema>;
+ export type SingleTask = z.infer<typeof SingleTaskSchema>;
+ 
+-// Остальные схемы (MutationResult) оставь как были
+ export const MutationResultSchema = z.object({
+   newSummary: z.string(),
+   subtasks: z.array(
+diff --git a/src/modules/queue/processors/notification.processor.ts b/src/modules/queue/processors/notification.processor.ts
+index 0d2d7d6..3ef36e0 100644
+--- a/src/modules/queue/processors/notification.processor.ts
++++ b/src/modules/queue/processors/notification.processor.ts
+@@ -1,23 +1,122 @@
+ import { Processor, WorkerHost } from '@nestjs/bullmq';
+-import { Job } from 'bullmq';
+ import { Injectable } from '@nestjs/common';
+-import { QUEUES } from '../queues.config';
++import { ConfigService } from '@nestjs/config';
++import { Job, UnrecoverableError } from 'bullmq';
++import { RequestContextService } from '../../../common/context/request-context.service';
+ import { PinoLoggerService } from '../../../common/logger/pino-logger.service';
++import {
++  NotificationJobData,
++  NotificationJobSchema,
++  StartNotificationCommandJobData,
++  StartNotificationCommandJobSchema,
++} from '../contracts/notification.job';
++import { QUEUES } from '../queues.config';
+ 
+ @Injectable()
+ @Processor(QUEUES.NOTIFICATIONS)
+ export class NotificationProcessor extends WorkerHost {
+-  constructor(private readonly logger: PinoLoggerService) {
++  private readonly botToken: string;
++
++  constructor(
++    private readonly logger: PinoLoggerService,
++    private readonly requestContext: RequestContextService,
++    private readonly configService: ConfigService,
++  ) {
+     super();
++    this.botToken = this.configService.get<string>('TELEGRAM_BOT_TOKEN') ?? '';
++  }
++
++  async process(job: Job<Record<string, unknown>>): Promise<void> {
++    const correlationId = this.extractCorrelationId(job.data);
++
++    await this.requestContext.run({ correlationId }, async () => {
++      const resolvedPayload = this.resolvePayload(job.data);
++      if (!resolvedPayload) {
++        this.logger.warn({
++          msg: 'Notification job payload is invalid',
++          queue: QUEUES.NOTIFICATIONS,
++          jobId: job.id,
++          payload: job.data,
++        });
++        throw new UnrecoverableError('QUEUE_JOB_PAYLOAD_INVALID');
++      }
++
++      this.logger.log({
++        msg: 'Notification job received',
++        queue: QUEUES.NOTIFICATIONS,
++        jobId: job.id,
++        chatId: resolvedPayload.chatId,
++      });
++
++      await this.sendNotification(resolvedPayload);
++    });
++  }
++
++  private resolvePayload(
++    payload: Record<string, unknown>,
++  ): NotificationJobData | null {
++    const regularNotification = NotificationJobSchema.safeParse(payload);
++    if (regularNotification.success) {
++      return regularNotification.data;
++    }
++
++    const startNotification = StartNotificationCommandJobSchema.safeParse(payload);
++    if (startNotification.success) {
++      return this.mapStartCommandPayload(startNotification.data);
++    }
++
++    return null;
++  }
++
++  private mapStartCommandPayload(
++    payload: StartNotificationCommandJobData,
++  ): NotificationJobData {
++    return {
++      chatId: payload.telegramChatId,
++      correlationId: payload.correlationId,
++      parseMode: 'HTML',
++      text: '👋 Привет! Отправь текст задачи, и я разобью его на план действий.',
++    };
+   }
+ 
+-  process(job: Job<Record<string, unknown>>): Promise<void> {
+-    this.logger.log({
+-      msg: 'Notification command job received',
+-      queue: QUEUES.NOTIFICATIONS,
+-      jobId: job.id,
+-      correlationId: job.data.correlationId,
++  private async sendNotification(payload: NotificationJobData): Promise<void> {
++    if (process.env.NODE_ENV === 'test') {
++      this.logger.log({
++        msg: 'Notification sending skipped in test environment',
++        chatId: payload.chatId,
++      });
++      return;
++    }
++
++    if (!this.botToken) {
++      throw new Error('QUEUE_NOTIFICATION_SEND_FAILED: missing Telegram bot token');
++    }
++
++    const url = `https://api.telegram.org/bot${this.botToken}/sendMessage`;
++    const response = await fetch(url, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++      },
++      body: JSON.stringify({
++        chat_id: payload.chatId,
++        text: payload.text,
++        parse_mode: payload.parseMode,
++      }),
+     });
+-    return Promise.resolve();
++
++    if (!response.ok) {
++      const body = await response.text();
++      throw new Error(
++        `QUEUE_NOTIFICATION_SEND_FAILED: telegram response ${response.status} ${body}`,
++      );
++    }
++  }
++
++  private extractCorrelationId(payload: Record<string, unknown>): string {
++    const maybeCorrelationId = payload.correlationId;
++    return typeof maybeCorrelationId === 'string' && maybeCorrelationId.length > 0
++      ? maybeCorrelationId
++      : 'unknown-correlation-id';
+   }
+ }
+diff --git a/src/modules/queue/processors/task-parsing.processor.ts b/src/modules/queue/processors/task-parsing.processor.ts
+index 023091b..39c5156 100644
+--- a/src/modules/queue/processors/task-parsing.processor.ts
++++ b/src/modules/queue/processors/task-parsing.processor.ts
+@@ -1,23 +1,438 @@
+-import { Processor, WorkerHost } from '@nestjs/bullmq';
+-import { Job } from 'bullmq';
+-import { Injectable } from '@nestjs/common';
+-import { QUEUES } from '../queues.config';
++import { InjectQueue, Processor, WorkerHost } from '@nestjs/bullmq';
++import { Inject, Injectable } from '@nestjs/common';
++import { InputType, Prisma, TaskStatus } from '@prisma/client';
++import { Job, Queue, UnrecoverableError } from 'bullmq';
++import { MetricsService } from '../../../common/metrics/metrics.service';
++import { RequestContextService } from '../../../common/context/request-context.service';
+ import { PinoLoggerService } from '../../../common/logger/pino-logger.service';
++import { PrismaService } from '../../../prisma/prisma.service';
++import { AI_TEXT_PARSER } from '../../ai/constants/ai.tokens';
++import type { IAiParser } from '../../ai/contracts/ai-parser.interface';
++import { AiParserError, isAiParserError } from '../../ai/errors/ai-parser.error';
++import { CORRECTIVE_TASK_PARSER_PROMPT } from '../../ai/prompts/deepseek-task-parser.prompt';
++import { ParsedTask } from '../../ai/validators/ai-output.validator';
++import { NotificationJobData } from '../contracts/notification.job';
++import {
++  TaskParsingJobData,
++  TaskParsingJobSchema,
++} from '../contracts/task-parsing.job';
++import { QUEUES } from '../queues.config';
++import { buildTaskIdFromIdempotencyKey } from '../utils/deterministic-uuid.util';
++
++const INVALID_OUTPUT_CODES = new Set([
++  'AI_PARSE_INVALID_JSON',
++  'AI_PARSE_ZOD_VALIDATION',
++]);
+ 
+ @Injectable()
+ @Processor(QUEUES.TASK_PARSING)
+ export class TaskParsingProcessor extends WorkerHost {
+-  constructor(private readonly logger: PinoLoggerService) {
++  constructor(
++    @Inject(AI_TEXT_PARSER) private readonly aiParser: IAiParser,
++    private readonly prisma: PrismaService,
++    @InjectQueue(QUEUES.NOTIFICATIONS)
++    private readonly notificationsQueue: Queue,
++    private readonly logger: PinoLoggerService,
++    private readonly metrics: MetricsService,
++    private readonly requestContext: RequestContextService,
++  ) {
+     super();
+   }
+ 
+-  process(job: Job<Record<string, unknown>>): Promise<void> {
+-    this.logger.log({
+-      msg: 'Task parsing job received',
++  async process(job: Job<Record<string, unknown>>): Promise<void> {
++    const parsed = TaskParsingJobSchema.safeParse(job.data);
++    if (!parsed.success) {
++      this.logger.warn({
++        msg: 'Task parsing job payload is invalid',
++        queue: QUEUES.TASK_PARSING,
++        jobId: job.id,
++        issues: parsed.error.issues,
++      });
++      throw new UnrecoverableError('QUEUE_JOB_PAYLOAD_INVALID');
++    }
++
++    await this.requestContext.run(
++      { correlationId: parsed.data.correlationId },
++      async () => {
++        await this.handleJob(job, parsed.data);
++      },
++    );
++  }
++
++  private async handleJob(
++    job: Job<Record<string, unknown>>,
++    payload: TaskParsingJobData,
++  ): Promise<void> {
++    const existingTasks = await this.loadExistingTasksByIdempotencyKey(
++      payload.idempotencyKey,
++    );
++
++    if (existingTasks.length > 0) {
++      this.metrics.incrementQueueIdempotencyHit(QUEUES.TASK_PARSING);
++      await this.enqueueExistingResultNotification(payload, existingTasks);
++      this.logger.log({
++        msg: 'Task parsing skipped due to idempotency hit',
++        queue: QUEUES.TASK_PARSING,
++        jobId: job.id,
++        idempotencyKey: payload.idempotencyKey,
++      });
++      return;
++    }
++
++    const parseStartedAt = Date.now();
++    let parsedTask: ParsedTask | null = null;
++    let fallbackReasonCode = 'AI_PARSE_PROVIDER_ERROR';
++
++    try {
++      parsedTask = await this.parseWithCorrectiveRetry(payload);
++    } catch (error: unknown) {
++      const mappedError = this.mapUnknownAiError(error);
++      fallbackReasonCode = mappedError.code;
++
++      if (mappedError.retriable && !this.isFinalQueueAttempt(job)) {
++        this.metrics.incrementAiParse('error', this.aiParser.provider);
++        this.logger.warn({
++          msg: 'Task parsing failed with retriable provider error',
++          queue: QUEUES.TASK_PARSING,
++          jobId: job.id,
++          idempotencyKey: payload.idempotencyKey,
++          code: mappedError.code,
++          attempt: job.attemptsMade + 1,
++          maxAttempts: this.getMaxAttempts(job),
++        });
++        throw mappedError;
++      }
++
++      this.logger.warn({
++        msg: 'Task parsing switched to fallback',
++        queue: QUEUES.TASK_PARSING,
++        jobId: job.id,
++        idempotencyKey: payload.idempotencyKey,
++        code: mappedError.code,
++      });
++    } finally {
++      this.metrics.observeAiParseDuration(
++        this.aiParser.provider,
++        Date.now() - parseStartedAt,
++      );
++    }
++
++    if (parsedTask) {
++      const createdTasks = await this.createParsedTasks(payload, parsedTask);
++      if (createdTasks === null) {
++        this.metrics.incrementQueueIdempotencyHit(QUEUES.TASK_PARSING);
++        const existingResult = await this.loadExistingTasksByIdempotencyKey(
++          payload.idempotencyKey,
++        );
++        await this.enqueueExistingResultNotification(payload, existingResult);
++        return;
++      }
++
++      await this.enqueueNotification(
++        {
++          chatId: payload.telegramChatId,
++          text: this.formatSuccessNotification(
++            createdTasks.map((task) => task.title),
++          ),
++          parseMode: 'HTML',
++          correlationId: payload.correlationId,
++        },
++        payload.idempotencyKey,
++      );
++
++      this.metrics.incrementAiParse('success', this.aiParser.provider);
++      this.metrics.incrementTasksCreated('ai', createdTasks.length);
++
++      this.logger.log({
++        msg: 'Task parsing completed successfully',
++        queue: QUEUES.TASK_PARSING,
++        jobId: job.id,
++        idempotencyKey: payload.idempotencyKey,
++        provider: this.aiParser.provider,
++        taskCount: createdTasks.length,
++      });
++      return;
++    }
++
++    const fallbackTask = await this.createFallbackTask(payload);
++    if (fallbackTask === null) {
++      this.metrics.incrementQueueIdempotencyHit(QUEUES.TASK_PARSING);
++      const existingResult = await this.loadExistingTasksByIdempotencyKey(
++        payload.idempotencyKey,
++      );
++      await this.enqueueExistingResultNotification(payload, existingResult);
++      return;
++    }
++
++    await this.enqueueNotification(
++      {
++        chatId: payload.telegramChatId,
++        text: this.formatFallbackNotification(fallbackReasonCode),
++        parseMode: 'HTML',
++        correlationId: payload.correlationId,
++      },
++      payload.idempotencyKey,
++    );
++
++    this.metrics.incrementAiParse('fallback', this.aiParser.provider);
++    this.metrics.incrementTasksCreated('fallback', 1);
++
++    this.logger.warn({
++      msg: 'Task parsing fallback task persisted',
+       queue: QUEUES.TASK_PARSING,
+       jobId: job.id,
+-      correlationId: job.data.correlationId,
++      idempotencyKey: payload.idempotencyKey,
++      fallbackReasonCode,
++      taskId: fallbackTask.id,
+     });
+-    return Promise.resolve();
++  }
++
++  private async parseWithCorrectiveRetry(
++    payload: TaskParsingJobData,
++  ): Promise<ParsedTask> {
++    try {
++      return await this.aiParser.parseText(payload.text, {
++        correlationId: payload.correlationId,
++        attempt: 1,
++      });
++    } catch (error: unknown) {
++      const aiError = this.mapUnknownAiError(error);
++      if (!INVALID_OUTPUT_CODES.has(aiError.code)) {
++        throw aiError;
++      }
++
++      this.logger.warn({
++        msg: 'AI output invalid, executing corrective retry',
++        queue: QUEUES.TASK_PARSING,
++        idempotencyKey: payload.idempotencyKey,
++        code: aiError.code,
++      });
++
++      return this.aiParser.parseText(payload.text, {
++        correlationId: payload.correlationId,
++        attempt: 2,
++        correctivePrompt: CORRECTIVE_TASK_PARSER_PROMPT,
++      });
++    }
++  }
++
++  private async createParsedTasks(
++    payload: TaskParsingJobData,
++    parsedTask: ParsedTask,
++  ): Promise<Array<{ id: string; title: string }> | null> {
++    try {
++      return await this.prisma.$transaction(async (tx) => {
++        const createdTasks: Array<{ id: string; title: string }> = [];
++
++        for (const [index, task] of parsedTask.tasks.entries()) {
++          const taskId = buildTaskIdFromIdempotencyKey(
++            payload.idempotencyKey,
++            index,
++          );
++
++          const createdTask = await tx.task.create({
++            data: {
++              id: taskId,
++              userId: payload.userId,
++              title: task.title,
++              summary: task.summary,
++              deadline: task.deadline ? new Date(task.deadline) : null,
++              status: TaskStatus.TODO,
++              originalInput: payload.text,
++              originalInputType: InputType.TEXT,
++            },
++            select: {
++              id: true,
++              title: true,
++            },
++          });
++
++          if (task.subtasks.length > 0) {
++            await tx.subtask.createMany({
++              data: task.subtasks.map((subtask, subtaskIndex) => ({
++                taskId: createdTask.id,
++                title: subtask.title,
++                order: subtask.order ?? subtaskIndex,
++              })),
++            });
++          }
++
++          createdTasks.push(createdTask);
++        }
++
++        return createdTasks;
++      });
++    } catch (error: unknown) {
++      if (this.isPrismaDuplicate(error)) {
++        return null;
++      }
++
++      this.logger.error({
++        msg: 'Failed to persist parsed tasks',
++        code: 'TASK_CREATE_FAILED',
++        idempotencyKey: payload.idempotencyKey,
++        error,
++      });
++      throw new Error('TASK_CREATE_FAILED');
++    }
++  }
++
++  private async createFallbackTask(
++    payload: TaskParsingJobData,
++  ): Promise<{ id: string } | null> {
++    const fallbackTaskId = buildTaskIdFromIdempotencyKey(
++      payload.idempotencyKey,
++      0,
++    );
++
++    try {
++      return await this.prisma.$transaction(async (tx) => {
++        return tx.task.create({
++          data: {
++            id: fallbackTaskId,
++            userId: payload.userId,
++            title: this.buildFallbackTitle(payload.text),
++            summary: null,
++            status: TaskStatus.PARSE_FAILED,
++            originalInput: payload.text,
++            originalInputType: InputType.TEXT,
++          },
++          select: { id: true },
++        });
++      });
++    } catch (error: unknown) {
++      if (this.isPrismaDuplicate(error)) {
++        return null;
++      }
++
++      this.logger.error({
++        msg: 'Failed to persist fallback task',
++        code: 'TASK_CREATE_FAILED',
++        idempotencyKey: payload.idempotencyKey,
++        error,
++      });
++      throw new Error('TASK_CREATE_FAILED');
++    }
++  }
++
++  private async enqueueNotification(
++    payload: NotificationJobData,
++    idempotencyKey: string,
++  ): Promise<void> {
++    await this.notificationsQueue.add('task-parse-notification', payload, {
++      jobId: `task-parsing-notification-${idempotencyKey}`,
++    });
++  }
++
++  private async enqueueExistingResultNotification(
++    payload: TaskParsingJobData,
++    tasks: Array<{ id: string; title: string; status: TaskStatus }>,
++  ): Promise<void> {
++    if (tasks.length === 0) {
++      return;
++    }
++
++    const isFallbackResult =
++      tasks.length === 1 && tasks[0].status === TaskStatus.PARSE_FAILED;
++
++    await this.enqueueNotification(
++      {
++        chatId: payload.telegramChatId,
++        text: isFallbackResult
++          ? this.formatFallbackNotification('AI_PARSE_ZOD_VALIDATION')
++          : this.formatSuccessNotification(tasks.map((task) => task.title)),
++        parseMode: 'HTML',
++        correlationId: payload.correlationId,
++      },
++      payload.idempotencyKey,
++    );
++  }
++
++  private async loadExistingTasksByIdempotencyKey(
++    idempotencyKey: string,
++  ): Promise<Array<{ id: string; title: string; status: TaskStatus }>> {
++    return this.prisma.task.findMany({
++      where: {
++        id: {
++          in: Array.from({ length: 5 }, (_, index) =>
++            buildTaskIdFromIdempotencyKey(idempotencyKey, index),
++          ),
++        },
++      },
++      select: {
++        id: true,
++        title: true,
++        status: true,
++      },
++      orderBy: {
++        createdAt: 'asc',
++      },
++    });
++  }
++
++  private isPrismaDuplicate(error: unknown): boolean {
++    return (
++      error instanceof Prisma.PrismaClientKnownRequestError &&
++      error.code === 'P2002'
++    );
++  }
++
++  private isFinalQueueAttempt(job: Job<Record<string, unknown>>): boolean {
++    return job.attemptsMade + 1 >= this.getMaxAttempts(job);
++  }
++
++  private getMaxAttempts(job: Job<Record<string, unknown>>): number {
++    return typeof job.opts.attempts === 'number' ? job.opts.attempts : 1;
++  }
++
++  private mapUnknownAiError(error: unknown): AiParserError {
++    if (isAiParserError(error)) {
++      return error;
++    }
++
++    return new AiParserError(
++      'AI_PARSE_PROVIDER_ERROR',
++      'AI parser failed with unknown error',
++      {
++        retriable: true,
++        cause: error,
++      },
++    );
++  }
++
++  private buildFallbackTitle(text: string): string {
++    const normalized = text.trim();
++    if (normalized.length === 0) {
++      return 'Untitled task';
++    }
++
++    return normalized.slice(0, 500);
++  }
++
++  private formatSuccessNotification(titles: string[]): string {
++    if (titles.length === 1) {
++      return `Task created: <b>${this.escapeHtml(titles[0])}</b>`;
++    }
++
++    const firstThree = titles
++      .slice(0, 3)
++      .map((title) => `- ${this.escapeHtml(title)}`)
++      .join('\n');
++
++    const extra = titles.length > 3 ? `\n... and ${titles.length - 3} more` : '';
++    return `Tasks created: <b>${titles.length}</b>\n${firstThree}${extra}`;
++  }
++
++  private formatFallbackNotification(reasonCode: string): string {
++    return `Could not parse the message (${this.escapeHtml(reasonCode)}). Saved as raw task.`;
++  }
++
++  private escapeHtml(value: string): string {
++    return value
++      .replaceAll('&', '&amp;')
++      .replaceAll('<', '&lt;')
++      .replaceAll('>', '&gt;')
++      .replaceAll('"', '&quot;')
++      .replaceAll("'", '&#39;');
+   }
+ }
+diff --git a/src/modules/queue/queue.module.ts b/src/modules/queue/queue.module.ts
+index c896d3e..48054a8 100644
+--- a/src/modules/queue/queue.module.ts
++++ b/src/modules/queue/queue.module.ts
+@@ -12,11 +12,15 @@ import { InviteAcceptanceProcessor } from './processors/invite-acceptance.proces
+ import { InviteDeclineProcessor } from './processors/invite-decline.processor';
+ import { AssigneeRevokeProcessor } from './processors/assignee-revoke.processor';
+ import { AssignmentsListProcessor } from './processors/assignments-list.processor';
++import { AiModule } from '../ai/ai.module';
++import { PrismaModule } from '../../prisma/prisma.module';
+ 
+ @Global()
+ @Module({
+   imports: [
+     ObservabilityModule,
++    AiModule,
++    PrismaModule,
+     BullModule.forRootAsync({
+       imports: [ConfigModule],
+       useFactory: (configService: ConfigService) => ({
+diff --git a/src/modules/telegram/telegram-queue-producer.service.ts b/src/modules/telegram/telegram-queue-producer.service.ts
+index fd7f8e5..270ca6d 100644
+--- a/src/modules/telegram/telegram-queue-producer.service.ts
++++ b/src/modules/telegram/telegram-queue-producer.service.ts
+@@ -12,8 +12,10 @@ export interface BaseTelegramJobPayload {
+ }
+ 
+ export interface TelegramTaskParsingJobPayload extends BaseTelegramJobPayload {
++  userId: string;
+   telegramMessageId: number;
+   text: string;
++  idempotencyKey: string;
+ }
+ 
+ export interface TelegramVoiceJobPayload extends BaseTelegramJobPayload {
+diff --git a/src/modules/telegram/telegram-webhook.service.ts b/src/modules/telegram/telegram-webhook.service.ts
+index 63193fb..d32f944 100644
+--- a/src/modules/telegram/telegram-webhook.service.ts
++++ b/src/modules/telegram/telegram-webhook.service.ts
+@@ -5,6 +5,7 @@ import {
+   Injectable,
+ } from '@nestjs/common';
+ import { ConfigService } from '@nestjs/config';
++import { createHash } from 'crypto';
+ import { PinoLoggerService } from '../../common/logger/pino-logger.service';
+ import { UserService } from '../user/user.service';
+ import { TelegramQueueProducerService } from './telegram-queue-producer.service';
+@@ -49,7 +50,7 @@ export class TelegramWebhookService {
+       return { ok: true };
+     }
+ 
+-    await this.userService.upsertTelegramUser({
++    const user = await this.userService.upsertTelegramUser({
+       telegramId: context.telegramUserId,
+       username: context.message.from?.username,
+       firstName: context.message.from?.first_name,
+@@ -81,11 +82,17 @@ export class TelegramWebhookService {
+ 
+       await this.queueProducer.enqueueTaskParsing({
+         telegramUpdateId: context.update.update_id,
++        userId: user.id,
+         telegramUserId: context.telegramUserId,
+         telegramChatId: context.telegramChatId,
+         telegramMessageId: context.message.message_id,
+         text: context.message.text,
+         correlationId,
++        idempotencyKey: this.buildTaskParsingIdempotencyKey(
++          context.telegramChatId,
++          context.message.message_id,
++          context.message.text,
++        ),
+       });
+ 
+       this.logger.log({
+@@ -185,4 +192,17 @@ export class TelegramWebhookService {
+       telegramChatId: message.chat.id,
+     };
+   }
++
++  private buildTaskParsingIdempotencyKey(
++    chatId: number,
++    messageId: number,
++    text: string,
++  ): string {
++    const normalizedText = text.trim().replace(/\s+/g, ' ');
++    const contentHash = createHash('sha256')
++      .update(`${chatId}:${messageId}:${normalizedText}`)
++      .digest('hex');
++
++    return `task-parse:${chatId}:${messageId}:${contentHash.slice(0, 24)}`;
++  }
+ }
+diff --git a/test/integration/telegram-queue-producer.integration-spec.ts b/test/integration/telegram-queue-producer.integration-spec.ts
+index a750aca..eeaf76e 100644
+--- a/test/integration/telegram-queue-producer.integration-spec.ts
++++ b/test/integration/telegram-queue-producer.integration-spec.ts
+@@ -38,11 +38,13 @@ describe('TelegramQueueProducerService (integration)', () => {
+   it('deduplicates jobs by update_id through BullMQ jobId', async () => {
+     const payload = {
+       telegramUpdateId: 9001,
++      userId: 'ab4a1f59-a3a3-4380-8edb-9e34dc413a2f',
+       telegramUserId: 10001,
+       telegramChatId: 11001,
+       telegramMessageId: 12001,
+       text: 'First text',
+       correlationId: 'integration-corr-1',
++      idempotencyKey: 'task-parse:test-key',
+     };
+ 
+     await producer.enqueueTaskParsing(payload);
+diff --git a/test/unit/telegram-webhook.service.spec.ts b/test/unit/telegram-webhook.service.spec.ts
+index 63de8f3..ea35192 100644
+--- a/test/unit/telegram-webhook.service.spec.ts
++++ b/test/unit/telegram-webhook.service.spec.ts
+@@ -97,11 +97,13 @@ describe('TelegramWebhookService', () => {
+     });
+     expect(queueProducer.enqueueTaskParsing).toHaveBeenCalledWith({
+       telegramUpdateId: 1001,
++      userId: 'user-id',
+       telegramUserId: 2001,
+       telegramChatId: 3001,
+       telegramMessageId: 77,
+       text: 'Buy milk tomorrow',
+       correlationId,
++      idempotencyKey: expect.stringMatching(/^task-parse:/),
+     });
+     expect(queueProducer.enqueueCommand).not.toHaveBeenCalled();
+     expect(queueProducer.enqueueVoiceTranscription).not.toHaveBeenCalled();
