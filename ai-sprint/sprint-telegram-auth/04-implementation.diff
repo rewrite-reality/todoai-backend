@@ -1,0 +1,1861 @@
+
+diff --git a/src/modules/auth/interfaces/init-data.interface.ts b/src/modules/auth/interfaces/init-data.interface.ts
+new file mode 100644
+index 0000000..673e225
+--- /dev/null
++++ b/src/modules/auth/interfaces/init-data.interface.ts
+@@ -0,0 +1,21 @@
++export interface InitDataUser {
++  id: number;
++  username?: string;
++  first_name?: string;
++  last_name?: string;
++  photo_url?: string;
++  language_code?: string;
++  allows_write_to_pm?: boolean;
++}
++
++export interface InitDataPayload {
++  auth_date: number;
++  hash: string;
++  query_id?: string;
++  start_param?: string;
++  chat_type?: string;
++  chat_instance?: string;
++  user: InitDataUser;
++  raw: string;
++  dataCheckString: string;
++}
+
+diff --git a/src/modules/auth/interfaces/jwt-payload.interface.ts b/src/modules/auth/interfaces/jwt-payload.interface.ts
+new file mode 100644
+index 0000000..2e7ad4f
+--- /dev/null
++++ b/src/modules/auth/interfaces/jwt-payload.interface.ts
+@@ -0,0 +1,49 @@
++export interface JwtPayload {
++  sub: string;
++  uid: string;
++  username?: string;
++  iat?: number;
++  exp?: number;
++}
++
++export const AUTH_ERROR_CODES = {
++  AUTH_INVALID_INIT_DATA: 'AUTH_INVALID_INIT_DATA',
++  AUTH_INIT_DATA_EXPIRED: 'AUTH_INIT_DATA_EXPIRED',
++  AUTH_INIT_DATA_HASH_MISMATCH: 'AUTH_INIT_DATA_HASH_MISMATCH',
++  AUTH_UNAUTHORIZED: 'AUTH_UNAUTHORIZED',
++  AUTH_USER_NOT_FOUND: 'AUTH_USER_NOT_FOUND',
++  AUTH_USER_CREATE_FAILED: 'AUTH_USER_CREATE_FAILED',
++} as const;
++
++export type AuthErrorCode =
++  (typeof AUTH_ERROR_CODES)[keyof typeof AUTH_ERROR_CODES];
++
++export const AUTH_ERROR_REGISTRY: Record<
++  AuthErrorCode,
++  { message: string; statusCode: number }
++> = {
++  AUTH_INVALID_INIT_DATA: {
++    message: 'Invalid Telegram initData payload',
++    statusCode: 400,
++  },
++  AUTH_INIT_DATA_EXPIRED: {
++    message: 'Telegram initData expired',
++    statusCode: 401,
++  },
++  AUTH_INIT_DATA_HASH_MISMATCH: {
++    message: 'Telegram initData hash mismatch',
++    statusCode: 401,
++  },
++  AUTH_UNAUTHORIZED: {
++    message: 'Unauthorized',
++    statusCode: 401,
++  },
++  AUTH_USER_NOT_FOUND: {
++    message: 'Authenticated user was not found',
++    statusCode: 404,
++  },
++  AUTH_USER_CREATE_FAILED: {
++    message: 'Unable to create or update authenticated user',
++    statusCode: 500,
++  },
++};
+
+diff --git a/src/common/interfaces/authenticated-request.interface.ts b/src/common/interfaces/authenticated-request.interface.ts
+new file mode 100644
+index 0000000..c14005c
+--- /dev/null
++++ b/src/common/interfaces/authenticated-request.interface.ts
+@@ -0,0 +1,6 @@
++import type { Request } from 'express';
++import type { JwtPayload } from '../../modules/auth/interfaces/jwt-payload.interface';
++
++export interface AuthenticatedRequest extends Request {
++  user: JwtPayload;
++}
+
+diff --git a/src/types/express.d.ts b/src/types/express.d.ts
+index 8b7b7f9..4b33762 100644
+--- a/src/types/express.d.ts
++++ b/src/types/express.d.ts
+@@ -1,7 +1,9 @@
+ import 'express-serve-static-core';
++import type { JwtPayload } from '../modules/auth/interfaces/jwt-payload.interface';
+ 
+ declare module 'express-serve-static-core' {
+   interface Request {
+     correlationId?: string;
++    user?: JwtPayload;
+   }
+ }
+
+diff --git a/src/common/decorators/public.decorator.ts b/src/common/decorators/public.decorator.ts
+new file mode 100644
+index 0000000..7aaff34
+--- /dev/null
++++ b/src/common/decorators/public.decorator.ts
+@@ -0,0 +1,22 @@
++import {
++  createParamDecorator,
++  ExecutionContext,
++  SetMetadata,
++} from '@nestjs/common';
++import type { AuthenticatedRequest } from '../interfaces/authenticated-request.interface';
++import type { JwtPayload } from '../../modules/auth/interfaces/jwt-payload.interface';
++
++export const IS_PUBLIC_KEY = 'isPublic';
++
++export const Public = (): MethodDecorator & ClassDecorator =>
++  SetMetadata(IS_PUBLIC_KEY, true);
++
++/**
++ * Returns authenticated JWT payload from request context.
++ */
++export const CurrentUser = createParamDecorator(
++  (_data: unknown, context: ExecutionContext): JwtPayload | undefined => {
++    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
++    return request.user;
++  },
++);
+
+diff --git a/src/modules/auth/services/init-data-validation.service.ts b/src/modules/auth/services/init-data-validation.service.ts
+new file mode 100644
+index 0000000..bfa8c2a
+--- /dev/null
++++ b/src/modules/auth/services/init-data-validation.service.ts
+@@ -0,0 +1,187 @@
++import { HttpException, Injectable } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { createHmac, timingSafeEqual } from 'crypto';
++import {
++  InitDataPayload,
++  InitDataUser,
++} from '../interfaces/init-data.interface';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++} from '../interfaces/jwt-payload.interface';
++
++const HASH_PARAM_NAME = 'hash';
++const AUTH_DATE_PARAM_NAME = 'auth_date';
++const USER_PARAM_NAME = 'user';
++const TELEGRAM_SECRET_SEED = 'WebAppData';
++
++@Injectable()
++export class InitDataValidationService {
++  constructor(private readonly configService: ConfigService) {}
++
++  /**
++   * Validates Telegram WebApp initData and returns normalized payload.
++   */
++  validate(initDataRaw: string): InitDataPayload {
++    if (typeof initDataRaw !== 'string' || initDataRaw.trim().length === 0) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    const params = new URLSearchParams(initDataRaw);
++    const hash = params.get(HASH_PARAM_NAME);
++    const authDateRaw = params.get(AUTH_DATE_PARAM_NAME);
++    const userRaw = params.get(USER_PARAM_NAME);
++
++    if (!hash || !authDateRaw || !userRaw) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    if (!/^[0-9a-f]{64}$/i.test(hash)) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    const authDate = Number(authDateRaw);
++    if (!Number.isInteger(authDate) || authDate <= 0) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    const dataCheckString = this.buildDataCheckString(params);
++    this.assertHashMatches(dataCheckString, hash);
++    this.assertFreshAuthDate(authDate);
++
++    return {
++      auth_date: authDate,
++      hash,
++      query_id: params.get('query_id') ?? undefined,
++      start_param: params.get('start_param') ?? undefined,
++      chat_type: params.get('chat_type') ?? undefined,
++      chat_instance: params.get('chat_instance') ?? undefined,
++      user: this.parseUser(userRaw),
++      raw: initDataRaw,
++      dataCheckString,
++    };
++  }
++
++  private parseUser(userRaw: string): InitDataUser {
++    let parsed: unknown;
++
++    try {
++      parsed = JSON.parse(userRaw);
++    } catch {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    const user = parsed as Record<string, unknown>;
++    const id = user.id;
++
++    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    return {
++      id,
++      username: this.optionalString(user.username),
++      first_name: this.optionalString(user.first_name),
++      last_name: this.optionalString(user.last_name),
++      photo_url: this.optionalString(user.photo_url),
++      language_code: this.optionalString(user.language_code),
++      allows_write_to_pm: this.optionalBoolean(user.allows_write_to_pm),
++    };
++  }
++
++  private optionalString(value: unknown): string | undefined {
++    if (value === undefined) {
++      return undefined;
++    }
++
++    if (typeof value !== 'string') {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    return value;
++  }
++
++  private optionalBoolean(value: unknown): boolean | undefined {
++    if (value === undefined) {
++      return undefined;
++    }
++
++    if (typeof value !== 'boolean') {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    return value;
++  }
++
++  private buildDataCheckString(params: URLSearchParams): string {
++    return [...params.entries()]
++      .filter(([key]) => key !== HASH_PARAM_NAME)
++      .sort(([left], [right]) => left.localeCompare(right))
++      .map(([key, value]) => `${key}=${value}`)
++      .join('\n');
++  }
++
++  private assertHashMatches(dataCheckString: string, hash: string): void {
++    const botToken =
++      this.configService.get<string>('BOT_TOKEN') ??
++      this.configService.get<string>('TELEGRAM_BOT_TOKEN');
++
++    if (!botToken || botToken.trim().length === 0) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA);
++    }
++
++    let secretKeyBuffer: Buffer | undefined;
++    let expectedHashBuffer: Buffer | undefined;
++    let providedHashBuffer: Buffer | undefined;
++
++    try {
++      secretKeyBuffer = createHmac('sha256', TELEGRAM_SECRET_SEED)
++        .update(botToken)
++        .digest();
++      expectedHashBuffer = createHmac('sha256', secretKeyBuffer)
++        .update(dataCheckString)
++        .digest();
++      providedHashBuffer = Buffer.from(hash.toLowerCase(), 'hex');
++
++      const sameLength =
++        expectedHashBuffer.length === providedHashBuffer.length;
++      const hashesMatch =
++        sameLength && timingSafeEqual(expectedHashBuffer, providedHashBuffer);
++
++      if (!hashesMatch) {
++        throw this.createAuthException(
++          AUTH_ERROR_CODES.AUTH_INIT_DATA_HASH_MISMATCH,
++        );
++      }
++    } finally {
++      secretKeyBuffer?.fill(0);
++      expectedHashBuffer?.fill(0);
++      providedHashBuffer?.fill(0);
++    }
++  }
++
++  private assertFreshAuthDate(authDate: number): void {
++    const maxAgeSeconds =
++      this.configService.get<number>('INIT_DATA_MAX_AGE_SECONDS') ?? 300;
++    const nowSeconds = Math.floor(Date.now() / 1000);
++
++    if (nowSeconds - authDate > maxAgeSeconds) {
++      throw this.createAuthException(AUTH_ERROR_CODES.AUTH_INIT_DATA_EXPIRED);
++    }
++  }
++
++  private createAuthException(code: keyof typeof AUTH_ERROR_REGISTRY) {
++    const error = AUTH_ERROR_REGISTRY[code];
++    return new HttpException(
++      {
++        code,
++        message: error.message,
++      },
++      error.statusCode,
++    );
++  }
++}
+
+diff --git a/src/modules/auth/services/jwt-token.service.ts b/src/modules/auth/services/jwt-token.service.ts
+new file mode 100644
+index 0000000..2935539
+--- /dev/null
++++ b/src/modules/auth/services/jwt-token.service.ts
+@@ -0,0 +1,104 @@
++import { Injectable, UnauthorizedException } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import {
++  JsonWebTokenError,
++  type JwtPayload as JsonWebTokenPayload,
++  type SignOptions,
++  sign,
++  TokenExpiredError,
++  verify,
++} from 'jsonwebtoken';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++  JwtPayload,
++} from '../interfaces/jwt-payload.interface';
++
++@Injectable()
++export class JwtTokenService {
++  private readonly jwtSecret: string;
++  private readonly jwtExpiresIn: SignOptions['expiresIn'];
++
++  constructor(private readonly configService: ConfigService) {
++    this.jwtSecret = this.configService.getOrThrow<string>('JWT_SECRET');
++    this.jwtExpiresIn = (this.configService.get<string>('JWT_EXPIRES_IN') ??
++      '1h') as SignOptions['expiresIn'];
++  }
++
++  /**
++   * Signs an access token using HS256.
++   */
++  signAccessToken(payload: JwtPayload): string {
++    return sign(payload, this.jwtSecret, {
++      algorithm: 'HS256',
++      expiresIn: this.jwtExpiresIn,
++    });
++  }
++
++  /**
++   * Returns configured access token lifetime.
++   */
++  getAccessTokenExpiresIn(): string {
++    return String(this.jwtExpiresIn);
++  }
++
++  /**
++   * Verifies bearer token and returns decoded JWT payload.
++   */
++  verifyAccessToken(token: string): JwtPayload {
++    try {
++      const decoded = verify(token, this.jwtSecret, {
++        algorithms: ['HS256'],
++      });
++
++      if (!decoded || typeof decoded === 'string') {
++        throw this.createUnauthorizedException();
++      }
++
++      return this.normalizeDecodedPayload(decoded);
++    } catch (error) {
++      if (error instanceof UnauthorizedException) {
++        throw error;
++      }
++
++      if (
++        error instanceof JsonWebTokenError ||
++        error instanceof TokenExpiredError
++      ) {
++        throw this.createUnauthorizedException();
++      }
++
++      throw error;
++    }
++  }
++
++  private normalizeDecodedPayload(decoded: JsonWebTokenPayload): JwtPayload {
++    const { sub, uid, username, iat, exp } = decoded as JsonWebTokenPayload & {
++      uid?: unknown;
++      username?: unknown;
++    };
++
++    if (typeof sub !== 'string' || typeof uid !== 'string') {
++      throw this.createUnauthorizedException();
++    }
++
++    if (username !== undefined && typeof username !== 'string') {
++      throw this.createUnauthorizedException();
++    }
++
++    return {
++      sub,
++      uid,
++      username,
++      iat: typeof iat === 'number' ? iat : undefined,
++      exp: typeof exp === 'number' ? exp : undefined,
++    };
++  }
++
++  private createUnauthorizedException(): UnauthorizedException {
++    return new UnauthorizedException({
++      code: AUTH_ERROR_CODES.AUTH_UNAUTHORIZED,
++      message: AUTH_ERROR_REGISTRY.AUTH_UNAUTHORIZED.message,
++    });
++  }
++}
+
+diff --git a/src/modules/user/user.service.ts b/src/modules/user/user.service.ts
+index 46adc0f..71bae9b 100644
+--- a/src/modules/user/user.service.ts
++++ b/src/modules/user/user.service.ts
+@@ -1,31 +1,56 @@
+ import { Injectable } from '@nestjs/common';
++import { Prisma } from '@prisma/client';
+ import { PrismaService } from '../../prisma/prisma.service';
+ 
+ export interface UpsertTelegramUserInput {
+   telegramId: number;
+   username?: string;
+   firstName?: string;
+   lastName?: string;
++  photoUrl?: string;
++  languageCode?: string;
+ }
+ 
+ @Injectable()
+ export class UserService {
+   constructor(private readonly prisma: PrismaService) {}
+ 
++  /**
++   * Creates or updates user profile using Telegram identity payload.
++   */
+   async upsertTelegramUser(input: UpsertTelegramUserInput) {
++    const telegramId = BigInt(input.telegramId);
+     const normalizedName = this.buildDisplayName(input);
++    const normalizedPhoto = this.normalizeOptionalString(input.photoUrl);
++    const normalizedLocale = this.normalizeLocale(input.languageCode);
++
++    const updateData: Prisma.UserUpdateInput = {
++      telegramName: normalizedName,
++    };
++
++    if (normalizedPhoto !== undefined) {
++      updateData.telegramPhoto = normalizedPhoto;
++    }
++
++    if (normalizedLocale !== undefined) {
++      updateData.locale = normalizedLocale;
++    }
++
++    const createData: Prisma.UserCreateInput = {
++      telegramId,
++      telegramName: normalizedName,
++      ...(normalizedPhoto !== undefined
++        ? { telegramPhoto: normalizedPhoto }
++        : {}),
++      ...(normalizedLocale !== undefined ? { locale: normalizedLocale } : {}),
++    };
+ 
+     return this.prisma.user.upsert({
+-      where: { telegramId: BigInt(input.telegramId) },
+-      update: {
+-        telegramName: normalizedName,
+-      },
+-      create: {
+-        telegramId: BigInt(input.telegramId),
+-        telegramName: normalizedName,
+-      },
++      where: { telegramId },
++      update: updateData,
++      create: createData,
+     });
+   }
+ 
+   private buildDisplayName(input: UpsertTelegramUserInput): string {
+     if (input.username && input.username.trim().length > 0) {
+@@ -36,6 +61,26 @@ export class UserService {
+     const lastName = input.lastName?.trim() ?? '';
+     const fullName = `${firstName} ${lastName}`.trim();
+ 
+     return fullName.length > 0 ? fullName : `telegram:${input.telegramId}`;
+   }
++
++  private normalizeOptionalString(
++    value: string | undefined,
++  ): string | undefined {
++    if (!value) {
++      return undefined;
++    }
++
++    const normalized = value.trim();
++    return normalized.length > 0 ? normalized : undefined;
++  }
++
++  private normalizeLocale(value: string | undefined): string | undefined {
++    const normalized = this.normalizeOptionalString(value);
++    if (!normalized) {
++      return undefined;
++    }
++
++    return normalized.toLowerCase().slice(0, 10);
++  }
+ }
+
+diff --git a/src/modules/auth/auth.service.ts b/src/modules/auth/auth.service.ts
+index e69de29..6daa2cf 100644
+--- a/src/modules/auth/auth.service.ts
++++ b/src/modules/auth/auth.service.ts
+@@ -0,0 +1,100 @@
++import { HttpException, Injectable } from '@nestjs/common';
++import { User } from '@prisma/client';
++import { PinoLoggerService } from '../../common/logger/pino-logger.service';
++import { UserService } from '../user/user.service';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++} from './interfaces/jwt-payload.interface';
++import { InitDataValidationService } from './services/init-data-validation.service';
++import { JwtTokenService } from './services/jwt-token.service';
++
++export interface TelegramAuthUser {
++  id: string;
++  telegramId: string;
++  telegramName: string | null;
++  telegramPhoto: string | null;
++  locale: string;
++}
++
++export interface TelegramAuthResponse {
++  accessToken: string;
++  tokenType: 'Bearer';
++  expiresIn: string;
++  user: TelegramAuthUser;
++}
++
++@Injectable()
++export class AuthService {
++  constructor(
++    private readonly initDataValidationService: InitDataValidationService,
++    private readonly userService: UserService,
++    private readonly jwtTokenService: JwtTokenService,
++    private readonly logger: PinoLoggerService,
++  ) {}
++
++  /**
++   * Authenticates a Telegram Mini App user and returns JWT credentials.
++   */
++  async authenticateWithTelegramInitData(
++    initDataRaw: string,
++    correlationId: string,
++  ): Promise<TelegramAuthResponse> {
++    const payload = this.initDataValidationService.validate(initDataRaw);
++
++    let user: User;
++    try {
++      user = await this.userService.upsertTelegramUser({
++        telegramId: payload.user.id,
++        username: payload.user.username,
++        firstName: payload.user.first_name,
++        lastName: payload.user.last_name,
++        photoUrl: payload.user.photo_url,
++        languageCode: payload.user.language_code,
++      });
++    } catch (error) {
++      this.logger.error({
++        msg: 'Failed to upsert Telegram user during authentication',
++        correlationId,
++        error: error instanceof Error ? error.message : String(error),
++      });
++
++      throw new HttpException(
++        {
++          code: AUTH_ERROR_CODES.AUTH_USER_CREATE_FAILED,
++          message: AUTH_ERROR_REGISTRY.AUTH_USER_CREATE_FAILED.message,
++        },
++        AUTH_ERROR_REGISTRY.AUTH_USER_CREATE_FAILED.statusCode,
++      );
++    }
++
++    const accessToken = this.jwtTokenService.signAccessToken({
++      sub: user.telegramId.toString(),
++      uid: user.id,
++      username: payload.user.username,
++    });
++
++    this.logger.log({
++      msg: 'Telegram authentication succeeded',
++      correlationId,
++      userId: user.id,
++    });
++
++    return {
++      accessToken,
++      tokenType: 'Bearer',
++      expiresIn: this.jwtTokenService.getAccessTokenExpiresIn(),
++      user: this.mapUser(user),
++    };
++  }
++
++  private mapUser(user: User): TelegramAuthUser {
++    return {
++      id: user.id,
++      telegramId: user.telegramId.toString(),
++      telegramName: user.telegramName,
++      telegramPhoto: user.telegramPhoto,
++      locale: user.locale,
++    };
++  }
++}
+
+diff --git a/src/common/guards/jwt-auth.guard.ts b/src/common/guards/jwt-auth.guard.ts
+new file mode 100644
+index 0000000..bd6aff9
+--- /dev/null
++++ b/src/common/guards/jwt-auth.guard.ts
+@@ -0,0 +1,107 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  Injectable,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { IS_PUBLIC_KEY } from '../decorators/public.decorator';
++import type { AuthenticatedRequest } from '../interfaces/authenticated-request.interface';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++} from '../../modules/auth/interfaces/jwt-payload.interface';
++import { JwtTokenService } from '../../modules/auth/services/jwt-token.service';
++
++const PUBLIC_ROUTE_ALLOWLIST = new Set<string>([
++  'GET:/health',
++  'POST:/auth/telegram',
++  'POST:/webhook/telegram',
++]);
++
++@Injectable()
++export class JwtAuthGuard implements CanActivate {
++  constructor(
++    private readonly reflector: Reflector,
++    private readonly jwtTokenService: JwtTokenService,
++  ) {}
++
++  /**
++   * Validates bearer token for protected routes and sets request.user.
++   */
++  canActivate(context: ExecutionContext): boolean {
++    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
++      context.getHandler(),
++      context.getClass(),
++    ]);
++
++    if (isPublic) {
++      return true;
++    }
++
++    const request = context.switchToHttp().getRequest<AuthenticatedRequest>();
++    if (this.isAllowlisted(request)) {
++      return true;
++    }
++
++    const token = this.extractBearerToken(request);
++    if (!token) {
++      throw this.createUnauthorizedException();
++    }
++
++    request.user = this.jwtTokenService.verifyAccessToken(token);
++    return true;
++  }
++
++  private isAllowlisted(request: AuthenticatedRequest): boolean {
++    const method = request.method.toUpperCase();
++    const path = this.normalizePath(request.path ?? request.url ?? '');
++    return PUBLIC_ROUTE_ALLOWLIST.has(`${method}:${path}`);
++  }
++
++  private normalizePath(rawPath: string): string {
++    const pathWithoutQuery = rawPath.split('?')[0] ?? '';
++    if (pathWithoutQuery.length <= 1) {
++      return pathWithoutQuery || '/';
++    }
++
++    return pathWithoutQuery.endsWith('/')
++      ? pathWithoutQuery.slice(0, -1)
++      : pathWithoutQuery;
++  }
++
++  private extractBearerToken(
++    request: AuthenticatedRequest,
++  ): string | undefined {
++    const authorizationHeader = request.headers.authorization as
++      | string
++      | string[]
++      | undefined;
++    const rawHeader = Array.isArray(authorizationHeader)
++      ? authorizationHeader[0]
++      : authorizationHeader;
++
++    if (typeof rawHeader !== 'string') {
++      return undefined;
++    }
++
++    const [scheme, token, ...rest] = rawHeader.trim().split(/\s+/);
++    if (
++      !scheme ||
++      !token ||
++      rest.length > 0 ||
++      scheme.toLowerCase() !== 'bearer'
++    ) {
++      return undefined;
++    }
++
++    return token;
++  }
++
++  private createUnauthorizedException(): UnauthorizedException {
++    return new UnauthorizedException({
++      code: AUTH_ERROR_CODES.AUTH_UNAUTHORIZED,
++      message: AUTH_ERROR_REGISTRY.AUTH_UNAUTHORIZED.message,
++    });
++  }
++}
+
+diff --git a/src/modules/auth/auth.controller.ts b/src/modules/auth/auth.controller.ts
+index e69de29..3663854 100644
+--- a/src/modules/auth/auth.controller.ts
++++ b/src/modules/auth/auth.controller.ts
+@@ -0,0 +1,102 @@
++import {
++  BadRequestException,
++  Body,
++  Controller,
++  HttpException,
++  HttpCode,
++  HttpStatus,
++  InternalServerErrorException,
++  Post,
++  Req,
++  UsePipes,
++  ValidationPipe,
++} from '@nestjs/common';
++import { IsNotEmpty, IsObject, IsString } from 'class-validator';
++import type { Request } from 'express';
++import { Public } from '../../common/decorators/public.decorator';
++import { PinoLoggerService } from '../../common/logger/pino-logger.service';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++} from './interfaces/jwt-payload.interface';
++import { AuthService, TelegramAuthResponse } from './auth.service';
++
++const TELEGRAM_AUTH_VALIDATION_PIPE = new ValidationPipe({
++  transform: false,
++  whitelist: true,
++  forbidNonWhitelisted: true,
++  exceptionFactory: () =>
++    new BadRequestException({
++      code: AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA,
++      message: AUTH_ERROR_REGISTRY.AUTH_INVALID_INIT_DATA.message,
++    }),
++});
++
++export class TelegramAuthRequestDto {
++  @IsString()
++  @IsNotEmpty()
++  initData!: string;
++}
++
++export class TelegramAuthResponseDto {
++  @IsString()
++  accessToken!: string;
++
++  @IsString()
++  tokenType!: 'Bearer';
++
++  @IsString()
++  expiresIn!: string;
++
++  @IsObject()
++  user!: TelegramAuthResponse['user'];
++}
++
++@Controller('auth')
++export class AuthController {
++  constructor(
++    private readonly authService: AuthService,
++    private readonly logger: PinoLoggerService,
++  ) {}
++
++  /**
++   * Exchanges Telegram WebApp initData for an access token.
++   */
++  @Post('telegram')
++  @Public()
++  @HttpCode(HttpStatus.OK)
++  @UsePipes(TELEGRAM_AUTH_VALIDATION_PIPE)
++  async authenticateTelegram(
++    @Body() body: TelegramAuthRequestDto,
++    @Req() request: Request,
++  ): Promise<TelegramAuthResponseDto> {
++    const correlationId = request.correlationId ?? 'unknown-correlation-id';
++
++    this.logger.log({
++      msg: 'Telegram auth request received',
++      correlationId,
++    });
++
++    try {
++      return await this.authService.authenticateWithTelegramInitData(
++        body.initData,
++        correlationId,
++      );
++    } catch (error) {
++      if (error instanceof HttpException) {
++        throw error;
++      }
++
++      this.logger.error({
++        msg: 'Unexpected error while authenticating Telegram initData',
++        correlationId,
++        error: error instanceof Error ? error.message : String(error),
++      });
++
++      throw new InternalServerErrorException({
++        code: AUTH_ERROR_CODES.AUTH_USER_CREATE_FAILED,
++        message: AUTH_ERROR_REGISTRY.AUTH_USER_CREATE_FAILED.message,
++      });
++    }
++  }
++}
+
+diff --git a/src/modules/auth/auth.module.ts b/src/modules/auth/auth.module.ts
+index e69de29..5968d22 100644
+--- a/src/modules/auth/auth.module.ts
++++ b/src/modules/auth/auth.module.ts
+@@ -0,0 +1,15 @@
++import { Module } from '@nestjs/common';
++import { ConfigModule } from '@nestjs/config';
++import { UserModule } from '../user/user.module';
++import { AuthController } from './auth.controller';
++import { AuthService } from './auth.service';
++import { InitDataValidationService } from './services/init-data-validation.service';
++import { JwtTokenService } from './services/jwt-token.service';
++
++@Module({
++  imports: [ConfigModule, UserModule],
++  controllers: [AuthController],
++  providers: [AuthService, InitDataValidationService, JwtTokenService],
++  exports: [AuthService, JwtTokenService],
++})
++export class AuthModule {}
+
+diff --git a/src/modules/health/health.controller.ts b/src/modules/health/health.controller.ts
+index ae5d559..8d4d9cd 100644
+--- a/src/modules/health/health.controller.ts
++++ b/src/modules/health/health.controller.ts
+@@ -1,12 +1,14 @@
+ import { Controller, Get } from '@nestjs/common';
++import { Public } from '../../common/decorators/public.decorator';
+ import { HealthService } from './health.service';
+ 
+ @Controller('health')
+ export class HealthController {
+   constructor(private readonly healthService: HealthService) {}
+ 
+   @Get()
++  @Public()
+   async health() {
+     return this.healthService.getHealth();
+   }
+ }
+
+diff --git a/src/modules/telegram/telegram.controller.ts b/src/modules/telegram/telegram.controller.ts
+index 822a999..7cc2fd1 100644
+--- a/src/modules/telegram/telegram.controller.ts
++++ b/src/modules/telegram/telegram.controller.ts
+@@ -1,16 +1,18 @@
+ import { Body, Controller, Headers, HttpCode, Post, Req } from '@nestjs/common';
+ import type { Request } from 'express';
++import { Public } from '../../common/decorators/public.decorator';
+ import { TelegramWebhookService } from './telegram-webhook.service';
+ 
+ @Controller('webhook/telegram')
+ export class TelegramController {
+   constructor(
+     private readonly telegramWebhookService: TelegramWebhookService,
+   ) {}
+ 
+   @Post()
++  @Public()
+   @HttpCode(200)
+   async handleWebhook(
+     @Body() update: unknown,
+     @Headers('x-telegram-bot-api-secret-token') secretToken: string | undefined,
+     @Req() req: Request,
+
+diff --git a/src/config/validation.schema.ts b/src/config/validation.schema.ts
+index 182423b..4c77e81 100644
+--- a/src/config/validation.schema.ts
++++ b/src/config/validation.schema.ts
+@@ -2,14 +2,19 @@ import { z } from 'zod';
+ 
+ export const EnvironmentSchema = z.object({
+   DATABASE_URL: z.string().url(),
+   REDIS_HOST: z.string().min(1),
+   REDIS_PORT: z.preprocess((val) => Number(val), z.number().int().positive()),
++  BOT_TOKEN: z.string().min(1).optional(),
+   TELEGRAM_BOT_TOKEN: z.string().min(1),
+   TELEGRAM_WEBHOOK_URL: z.string().url(),
+   TELEGRAM_WEBHOOK_SECRET: z.string().min(1),
+   JWT_SECRET: z.string().min(1),
++  JWT_EXPIRES_IN: z.string().min(1).default('1h'),
++  INIT_DATA_MAX_AGE_SECONDS: z
++    .preprocess((val) => Number(val), z.number().int().positive())
++    .default(300),
+   ENCRYPTION_KEY: z
+     .string()
+     .length(32, 'ENCRYPTION_KEY must be 32 bytes long for AES-256-GCM'),
+ });
+ 
+
+diff --git a/src/config/configuration.ts b/src/config/configuration.ts
+index 03978ee..123529b 100644
+--- a/src/config/configuration.ts
++++ b/src/config/configuration.ts
+@@ -10,9 +10,12 @@ export default () => {
+     },
+     telegram: {
+       botToken: envVars.TELEGRAM_BOT_TOKEN,
+       webhookSecret: envVars.TELEGRAM_WEBHOOK_SECRET,
+     },
++    botToken: envVars.BOT_TOKEN ?? envVars.TELEGRAM_BOT_TOKEN,
+     jwtSecret: envVars.JWT_SECRET,
++    jwtExpiresIn: envVars.JWT_EXPIRES_IN,
++    initDataMaxAgeSeconds: envVars.INIT_DATA_MAX_AGE_SECONDS,
+     encryptionKey: envVars.ENCRYPTION_KEY,
+   };
+ };
+
+diff --git a/src/app.module.ts b/src/app.module.ts
+index 1d5618e..b84a26a 100644
+--- a/src/app.module.ts
++++ b/src/app.module.ts
+@@ -1,7 +1,7 @@
+ import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
+-import { APP_FILTER } from '@nestjs/core';
++import { APP_FILTER, APP_GUARD } from '@nestjs/core';
+ import { ConfigModule } from '@nestjs/config';
+ import { AppController } from './app.controller';
+ import { AppService } from './app.service';
+ import configuration from './config/configuration';
+ import { EnvironmentSchema } from './config/validation.schema';
+@@ -11,10 +11,12 @@ import { QueueModule } from './modules/queue/queue.module';
+ import { HealthModule } from './modules/health/health.module';
+ import { CorrelationIdMiddleware } from './common/middleware/correlation-id.middleware';
+ import { ObservabilityModule } from './common/observability/observability.module';
+ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
+ import { RedisModule } from './common/redis/redis.module';
++import { AuthModule } from './modules/auth/auth.module';
++import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
+ 
+ @Module({
+   imports: [
+     ConfigModule.forRoot({
+       isGlobal: true,
+@@ -24,10 +26,11 @@ import { RedisModule } from './common/redis/redis.module';
+       },
+     }),
+     ObservabilityModule,
+     RedisModule,
+     PrismaModule,
++    AuthModule,
+     TelegramModule,
+     QueueModule,
+     HealthModule,
+   ],
+   controllers: [AppController],
+@@ -35,10 +38,14 @@ import { RedisModule } from './common/redis/redis.module';
+     AppService,
+     {
+       provide: APP_FILTER,
+       useClass: AllExceptionsFilter,
+     },
++    {
++      provide: APP_GUARD,
++      useClass: JwtAuthGuard,
++    },
+   ],
+ })
+ export class AppModule implements NestModule {
+   configure(consumer: MiddlewareConsumer) {
+     consumer.apply(CorrelationIdMiddleware).forRoutes('*');
+
+diff --git a/package.json b/package.json
+index 136aafc..d2ccbba 100644
+--- a/package.json
++++ b/package.json
+@@ -33,12 +33,15 @@
+     "@nestjs/platform-express": "^11.0.1",
+     "@prisma/adapter-pg": "^7.3.0",
+     "@prisma/client": "^7.3.0",
+     "@prisma/config": "^7.3.0",
+     "bullmq": "^5.67.3",
++    "class-transformer": "^0.5.1",
++    "class-validator": "^0.14.1",
+     "dotenv": "^17.2.3",
+     "ioredis": "^5.9.2",
++    "jsonwebtoken": "^9.0.2",
+     "openai": "^6.18.0",
+     "pino": "^9.3.2",
+     "pg": "^8.18.0",
+     "reflect-metadata": "^0.2.2",
+     "rxjs": "^7.8.1",
+@@ -51,10 +54,11 @@
+     "@nestjs/cli": "^11.0.0",
+     "@nestjs/schematics": "^11.0.0",
+     "@nestjs/testing": "^11.0.1",
+     "@types/express": "^5.0.0",
+     "@types/ioredis": "^4.28.10",
++    "@types/jsonwebtoken": "^9.0.10",
+     "@types/jest": "^30.0.0",
+     "@types/node": "^22.19.9",
+     "@types/pg": "^8.16.0",
+     "@types/supertest": "^6.0.2",
+     "prisma": "^7.3.0",
+
+diff --git a/package-lock.json b/package-lock.json
+index d77aaa6..fe0ffe5 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -16,12 +16,15 @@
+         "@nestjs/platform-express": "^11.0.1",
+         "@prisma/adapter-pg": "^7.3.0",
+         "@prisma/client": "^7.3.0",
+         "@prisma/config": "^7.3.0",
+         "bullmq": "^5.67.3",
++        "class-transformer": "^0.5.1",
++        "class-validator": "^0.14.1",
+         "dotenv": "^17.2.3",
+         "ioredis": "^5.9.2",
++        "jsonwebtoken": "^9.0.2",
+         "openai": "^6.18.0",
+         "pg": "^8.18.0",
+         "pino": "^9.3.2",
+         "reflect-metadata": "^0.2.2",
+         "rxjs": "^7.8.1",
+@@ -35,10 +38,11 @@
+         "@nestjs/schematics": "^11.0.0",
+         "@nestjs/testing": "^11.0.1",
+         "@types/express": "^5.0.0",
+         "@types/ioredis": "^4.28.10",
+         "@types/jest": "^30.0.0",
++        "@types/jsonwebtoken": "^9.0.10",
+         "@types/node": "^22.19.9",
+         "@types/pg": "^8.16.0",
+         "@types/supertest": "^6.0.2",
+         "eslint": "^9.18.0",
+         "eslint-config-prettier": "^10.0.1",
+@@ -3305,17 +3309,35 @@
+       "resolved": "https://registry.npmjs.org/@types/json-schema/-/json-schema-7.0.15.tgz",
+       "integrity": "sha512-5+fP8P8MFNC+AyZCDxrB2pkZFPGzqQWUzpSeuuVLvm8VMcorNYavBqoFcxK8bQz4Qsbn4oUEEem4wDLfcysGHA==",
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/@types/jsonwebtoken": {
++      "version": "9.0.10",
++      "resolved": "https://registry.npmjs.org/@types/jsonwebtoken/-/jsonwebtoken-9.0.10.tgz",
++      "integrity": "sha512-asx5hIG9Qmf/1oStypjanR7iKTv0gXQ1Ov/jfrX6kS/EO0OFni8orbmGCn0672NHR3kXHwpAwR+B368ZGN/2rA==",
++      "dev": true,
++      "license": "MIT",
++      "dependencies": {
++        "@types/ms": "*",
++        "@types/node": "*"
++      }
++    },
+     "node_modules/@types/methods": {
+       "version": "1.1.4",
+       "resolved": "https://registry.npmjs.org/@types/methods/-/methods-1.1.4.tgz",
+       "integrity": "sha512-ymXWVrDiCxTBE3+RIrrP533E70eA+9qu7zdWoHuOmGujkYtzf4HQF96b8nwHLqhuf4ykX61IGRIB38CC6/sImQ==",
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/@types/ms": {
++      "version": "2.1.0",
++      "resolved": "https://registry.npmjs.org/@types/ms/-/ms-2.1.0.tgz",
++      "integrity": "sha512-GsCCIZDE/p3i96vtEqx+7dBUGXrc7zeSK3wwPHIaRThS+9OhWIXRqzs4d6k1SVU8g91DrNRWxWUGhp5KXQb2VA==",
++      "dev": true,
++      "license": "MIT"
++    },
+     "node_modules/@types/node": {
+       "version": "22.19.9",
+       "resolved": "https://registry.npmjs.org/@types/node/-/node-22.19.9.tgz",
+       "integrity": "sha512-PD03/U8g1F9T9MI+1OBisaIARhSzeidsUjQaf51fOxrfjeiKN9bLVO06lHuHYjxdnqLWJijJHfqXPSJri2EM2A==",
+       "dev": true,
+@@ -3411,10 +3433,16 @@
+       "dependencies": {
+         "@types/methods": "^1.1.4",
+         "@types/superagent": "^8.1.0"
+       }
+     },
++    "node_modules/@types/validator": {
++      "version": "13.15.10",
++      "resolved": "https://registry.npmjs.org/@types/validator/-/validator-13.15.10.tgz",
++      "integrity": "sha512-T8L6i7wCuyoK8A/ZeLYt1+q0ty3Zb9+qbSSvrIVitzT3YjZqkTZ40IbRsPanlB4h1QB3JVL1SYCdR6ngtFYcuA==",
++      "license": "MIT"
++    },
+     "node_modules/@types/yargs": {
+       "version": "17.0.35",
+       "resolved": "https://registry.npmjs.org/@types/yargs/-/yargs-17.0.35.tgz",
+       "integrity": "sha512-qUHkeCyQFxMXg79wQfTtfndEC+N9ZZg76HJftDJp+qH2tV7Gj4OJi7l+PiWwJ+pWtW8GwSmqsDj/oymhrTWXjg==",
+       "dev": true,
+@@ -4722,10 +4750,16 @@
+       "version": "1.1.0",
+       "resolved": "https://registry.npmjs.org/buffer-alloc-unsafe/-/buffer-alloc-unsafe-1.1.0.tgz",
+       "integrity": "sha512-TEM2iMIEQdJ2yjPJoSIsldnleVaAk1oW3DBVUykyOLsEsFmEc9kn+SFFPz+gl54KQNxlDnAwCXosOS9Okx2xAg==",
+       "license": "MIT"
+     },
++    "node_modules/buffer-equal-constant-time": {
++      "version": "1.0.1",
++      "resolved": "https://registry.npmjs.org/buffer-equal-constant-time/-/buffer-equal-constant-time-1.0.1.tgz",
++      "integrity": "sha512-zRpUiDwd/xk6ADqPMATG8vc9VPrkck7T07OIx0gnjmJAnHnTVXNQG3vfvWNuiZIkwu9KrKdA1iJKfsfTVxE6NA==",
++      "license": "BSD-3-Clause"
++    },
+     "node_modules/buffer-fill": {
+       "version": "1.0.0",
+       "resolved": "https://registry.npmjs.org/buffer-fill/-/buffer-fill-1.0.0.tgz",
+       "integrity": "sha512-T7zexNBwiiaCOGDg9xNX9PBmjrubblRkENuptryuI64URkXDFum9il/JGL8Lm8wYfAXpredVXXZz7eMHilimiQ==",
+       "license": "MIT"
+@@ -4992,10 +5026,27 @@
+       "resolved": "https://registry.npmjs.org/cjs-module-lexer/-/cjs-module-lexer-2.2.0.tgz",
+       "integrity": "sha512-4bHTS2YuzUvtoLjdy+98ykbNB5jS0+07EvFNXerqZQJ89F7DI6ET7OQo/HJuW6K0aVsKA9hj9/RVb2kQVOrPDQ==",
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/class-transformer": {
++      "version": "0.5.1",
++      "resolved": "https://registry.npmjs.org/class-transformer/-/class-transformer-0.5.1.tgz",
++      "integrity": "sha512-SQa1Ws6hUbfC98vKGxZH3KFY0Y1lm5Zm0SY8XX9zbK7FJCyVEac3ATW0RIpwzW+oOfmHE5PMPufDG9hCfoEOMw==",
++      "license": "MIT"
++    },
++    "node_modules/class-validator": {
++      "version": "0.14.3",
++      "resolved": "https://registry.npmjs.org/class-validator/-/class-validator-0.14.3.tgz",
++      "integrity": "sha512-rXXekcjofVN1LTOSw+u4u9WXVEUvNBVjORW154q/IdmYWy1nMbOU9aNtZB0t8m+FJQ9q91jlr2f9CwwUFdFMRA==",
++      "license": "MIT",
++      "dependencies": {
++        "@types/validator": "^13.15.3",
++        "libphonenumber-js": "^1.11.1",
++        "validator": "^13.15.20"
++      }
++    },
+     "node_modules/cli-cursor": {
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/cli-cursor/-/cli-cursor-3.1.0.tgz",
+       "integrity": "sha512-I/zHAwsKf9FqGoXM4WWRACob9+SNukZTd94DWF57E4toouRulbCxcUh6RKUEOQlYTHJnzkPMySvPNaaSLNfLZw==",
+       "dev": true,
+@@ -5578,10 +5629,19 @@
+       "resolved": "https://registry.npmjs.org/eastasianwidth/-/eastasianwidth-0.2.0.tgz",
+       "integrity": "sha512-I88TYZWc9XiYHRQ4/3c5rjjfgkjhLyW2luGIheGERbNQ6OY7yTybanSpDXZa8y7VUP9YmDcYa+eyq4ca7iLqWA==",
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/ecdsa-sig-formatter": {
++      "version": "1.0.11",
++      "resolved": "https://registry.npmjs.org/ecdsa-sig-formatter/-/ecdsa-sig-formatter-1.0.11.tgz",
++      "integrity": "sha512-nagl3RYrbNv6kQkeJIpt6NJZy8twLB/2vtz6yN9Z4vRKHN4/QZJIEbqohALSgwKdnksuY3k5Addp5lg8sVoVcQ==",
++      "license": "Apache-2.0",
++      "dependencies": {
++        "safe-buffer": "^5.0.1"
++      }
++    },
+     "node_modules/ee-first": {
+       "version": "1.1.1",
+       "resolved": "https://registry.npmjs.org/ee-first/-/ee-first-1.1.1.tgz",
+       "integrity": "sha512-WMwm9LhRUo+WUaRN+vRuETqG89IgZphVSNkdFgeb6sS/E4OrDIN7t48CAewSHXc6C8lefD8KKfr5vY61brQlow==",
+       "license": "MIT"
+@@ -8043,10 +8103,53 @@
+       },
+       "optionalDependencies": {
+         "graceful-fs": "^4.1.6"
+       }
+     },
++    "node_modules/jsonwebtoken": {
++      "version": "9.0.3",
++      "resolved": "https://registry.npmjs.org/jsonwebtoken/-/jsonwebtoken-9.0.3.tgz",
++      "integrity": "sha512-MT/xP0CrubFRNLNKvxJ2BYfy53Zkm++5bX9dtuPbqAeQpTVe0MQTFhao8+Cp//EmJp244xt6Drw/GVEGCUj40g==",
++      "license": "MIT",
++      "dependencies": {
++        "jws": "^4.0.1",
++        "lodash.includes": "^4.3.0",
++        "lodash.isboolean": "^3.0.3",
++        "lodash.isinteger": "^4.0.4",
++        "lodash.isnumber": "^3.0.3",
++        "lodash.isplainobject": "^4.0.6",
++        "lodash.isstring": "^4.0.1",
++        "lodash.once": "^4.0.0",
++        "ms": "^2.1.1",
++        "semver": "^7.5.4"
++      },
++      "engines": {
++        "node": ">=12",
++        "npm": ">=6"
++      }
++    },
++    "node_modules/jwa": {
++      "version": "2.0.1",
++      "resolved": "https://registry.npmjs.org/jwa/-/jwa-2.0.1.tgz",
++      "integrity": "sha512-hRF04fqJIP8Abbkq5NKGN0Bbr3JxlQ+qhZufXVr0DvujKy93ZCbXZMHDL4EOtodSbCWxOqR8MS1tXA5hwqCXDg==",
++      "license": "MIT",
++      "dependencies": {
++        "buffer-equal-constant-time": "^1.0.1",
++        "ecdsa-sig-formatter": "1.0.11",
++        "safe-buffer": "^5.0.1"
++      }
++    },
++    "node_modules/jws": {
++      "version": "4.0.1",
++      "resolved": "https://registry.npmjs.org/jws/-/jws-4.0.1.tgz",
++      "integrity": "sha512-EKI/M/yqPncGUUh44xz0PxSidXFr/+r0pA70+gIYhjv+et7yxM+s29Y+VGDkovRofQem0fs7Uvf4+YmAdyRduA==",
++      "license": "MIT",
++      "dependencies": {
++        "jwa": "^2.0.1",
++        "safe-buffer": "^5.0.1"
++      }
++    },
+     "node_modules/keyv": {
+       "version": "4.5.4",
+       "resolved": "https://registry.npmjs.org/keyv/-/keyv-4.5.4.tgz",
+       "integrity": "sha512-oxVHkHR/EJf2CNXnWxRLW6mg7JyCCUcG0DtEGmL2ctUo1PNTin1PUil+r/+4r5MpVgC/fn1kjsx7mjSujKqIpw==",
+       "dev": true,
+@@ -8077,10 +8180,16 @@
+       },
+       "engines": {
+         "node": ">= 0.8.0"
+       }
+     },
++    "node_modules/libphonenumber-js": {
++      "version": "1.12.36",
++      "resolved": "https://registry.npmjs.org/libphonenumber-js/-/libphonenumber-js-1.12.36.tgz",
++      "integrity": "sha512-woWhKMAVx1fzzUnMCyOzglgSgf6/AFHLASdOBcchYCyvWSGWt12imw3iu2hdI5d4dGZRsNWAmWiz37sDKUPaRQ==",
++      "license": "MIT"
++    },
+     "node_modules/lilconfig": {
+       "version": "2.1.0",
+       "resolved": "https://registry.npmjs.org/lilconfig/-/lilconfig-2.1.0.tgz",
+       "integrity": "sha512-utWOt/GHzuUxnLKxB6dk81RoOeoNeHgbrXiuGk4yyF5qlRz+iIVWu56E2fqGHFrXz0QNUhLB/8nKqvRH66JKGQ==",
+       "devOptional": true,
+@@ -8155,16 +8264,52 @@
+       "version": "4.2.0",
+       "resolved": "https://registry.npmjs.org/lodash.defaults/-/lodash.defaults-4.2.0.tgz",
+       "integrity": "sha512-qjxPLHd3r5DnsdGacqOMU6pb/avJzdh9tFX2ymgoZE27BmjXrNy/y4LoaiTeAb+O3gL8AfpJGtqfX/ae2leYYQ==",
+       "license": "MIT"
+     },
++    "node_modules/lodash.includes": {
++      "version": "4.3.0",
++      "resolved": "https://registry.npmjs.org/lodash.includes/-/lodash.includes-4.3.0.tgz",
++      "integrity": "sha512-W3Bx6mdkRTGtlJISOvVD/lbqjTlPPUDTMnlXZFnVwi9NKJ6tiAk6LVdlhZMm17VZisqhKcgzpO5Wz91PCt5b0w==",
++      "license": "MIT"
++    },
+     "node_modules/lodash.isarguments": {
+       "version": "3.1.0",
+       "resolved": "https://registry.npmjs.org/lodash.isarguments/-/lodash.isarguments-3.1.0.tgz",
+       "integrity": "sha512-chi4NHZlZqZD18a0imDHnZPrDeBbTtVN7GXMwuGdRH9qotxAjYs3aVLKc7zNOG9eddR5Ksd8rvFEBc9SsggPpg==",
+       "license": "MIT"
+     },
++    "node_modules/lodash.isboolean": {
++      "version": "3.0.3",
++      "resolved": "https://registry.npmjs.org/lodash.isboolean/-/lodash.isboolean-3.0.3.tgz",
++      "integrity": "sha512-Bz5mupy2SVbPHURB98VAcw+aHh4vRV5IPNhILUCsOzRmsTmSQ17jIuqopAentWoehktxGd9e/hbIXq980/1QJg==",
++      "license": "MIT"
++    },
++    "node_modules/lodash.isinteger": {
++      "version": "4.0.4",
++      "resolved": "https://registry.npmjs.org/lodash.isinteger/-/lodash.isinteger-4.0.4.tgz",
++      "integrity": "sha512-DBwtEWN2caHQ9/imiNeEA5ys1JoRtRfY3d7V9wkqtbycnAmTvRRmbHKDV4a0EYc678/dia0jrte4tjYwVBaZUA==",
++      "license": "MIT"
++    },
++    "node_modules/lodash.isnumber": {
++      "version": "3.0.3",
++      "resolved": "https://registry.npmjs.org/lodash.isnumber/-/lodash.isnumber-3.0.3.tgz",
++      "integrity": "sha512-QYqzpfwO3/CWf3XP+Z+tkQsfaLL/EnUlXWVkIk5FUPc4sBdTehEqZONuyRt2P67PXAk+NXmTBcc97zw9t1FQrw==",
++      "license": "MIT"
++    },
++    "node_modules/lodash.isplainobject": {
++      "version": "4.0.6",
++      "resolved": "https://registry.npmjs.org/lodash.isplainobject/-/lodash.isplainobject-4.0.6.tgz",
++      "integrity": "sha512-oSXzaWypCMHkPC3NvBEaPHf0KsA5mvPrOPgQWDsbg8n7orZ290M0BmC/jgRZ4vcJ6DTAhjrsSYgdsW/F+MFOBA==",
++      "license": "MIT"
++    },
++    "node_modules/lodash.isstring": {
++      "version": "4.0.1",
++      "resolved": "https://registry.npmjs.org/lodash.isstring/-/lodash.isstring-4.0.1.tgz",
++      "integrity": "sha512-0wJxfxH1wgO3GrbuP+dTTk7op+6L41QCXbGINEmD+ny/G/eCqGzxyCsh7159S+mgDDcoarnBw6PC1PS5+wUGgw==",
++      "license": "MIT"
++    },
+     "node_modules/lodash.memoize": {
+       "version": "4.1.2",
+       "resolved": "https://registry.npmjs.org/lodash.memoize/-/lodash.memoize-4.1.2.tgz",
+       "integrity": "sha512-t7j+NzmgnQzTAYXcsHYLgimltOV1MXHtlOWf6GjL9Kj8GK5FInw5JotxvbOs+IvV1/Dzo04/fCGfLVs7aXb4Ag==",
+       "dev": true,
+@@ -8175,10 +8320,16 @@
+       "resolved": "https://registry.npmjs.org/lodash.merge/-/lodash.merge-4.6.2.tgz",
+       "integrity": "sha512-0KpjqXRVvrYyCsX1swR/XTK0va6VQkQM6MNo7PqW77ByjAhoARA8EfrP1N4+KlKj8YS0ZUCtRT/YUuhyYDujIQ==",
+       "dev": true,
+       "license": "MIT"
+     },
++    "node_modules/lodash.once": {
++      "version": "4.1.1",
++      "resolved": "https://registry.npmjs.org/lodash.once/-/lodash.once-4.1.1.tgz",
++      "integrity": "sha512-Sb487aTOCr9drQVL8pIxOzVhafOjZN9UU54hiN8PU3uAiSV7lx1yYNpbNmex2PK6dSJoNTSJUUswT651yww3Mg==",
++      "license": "MIT"
++    },
+     "node_modules/log-symbols": {
+       "version": "4.1.0",
+       "resolved": "https://registry.npmjs.org/log-symbols/-/log-symbols-4.1.0.tgz",
+       "integrity": "sha512-8XPvpAA8uyhfteu8pIvQxpJZ7SYYdpUivZpGy6sFsBuKRY/7rQGavedeB8aK+Zkyq6upMFVL/9AW6vOYzfRyLg==",
+       "dev": true,
+@@ -11280,10 +11431,19 @@
+         "typescript": {
+           "optional": true
+         }
+       }
+     },
++    "node_modules/validator": {
++      "version": "13.15.26",
++      "resolved": "https://registry.npmjs.org/validator/-/validator-13.15.26.tgz",
++      "integrity": "sha512-spH26xU080ydGggxRyR1Yhcbgx+j3y5jbNXk/8L+iRvdIEQ4uTRH2Sgf2dokud6Q4oAtsbNvJ1Ft+9xmm6IZcA==",
++      "license": "MIT",
++      "engines": {
++        "node": ">= 0.10"
++      }
++    },
+     "node_modules/vary": {
+       "version": "1.1.2",
+       "resolved": "https://registry.npmjs.org/vary/-/vary-1.1.2.tgz",
+       "integrity": "sha512-BNGbWLfd0eUPabhkXUVm0j8uuvREyTh5ovRa/dyow/BqAbZJyC+5fU+IzQOzmAKzYqYRAISoRhdQr3eIZ/PXqg==",
+       "license": "MIT",
+
+diff --git a/.env.example b/.env.example
+index 271ffee..81f1de0 100644
+--- a/.env.example
++++ b/.env.example
+@@ -20,13 +20,16 @@ NODE_ENV=development
+ PORT=3000
+ 
+ 
+ # Telegram Bot
+ TELEGRAM_BOT_TOKEN=your_bot_token_here
++BOT_TOKEN=your_bot_token_here
+ TELEGRAM_WEBHOOK_SECRET=your_webhook_secret_here
+ NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=your_bot_username
+ 
+ # OpenAI
+ OPENAI_API_KEY=your_openai_api_key_here
+ 
+ # Auth
+ JWT_SECRET=your_jwt_secret_here_change_in_production
++JWT_EXPIRES_IN=1h
++INIT_DATA_MAX_AGE_SECONDS=300
+
+diff --git a/.env.test b/.env.test
+index 5b08b80..0d0bfe5 100644
+--- a/.env.test
++++ b/.env.test
+@@ -14,12 +14,15 @@ REDIS_HOST=127.0.0.1
+ REDIS_PORT=56380
+ REDIS_PASSWORD=redis_test_password
+ REDIS_URL=redis://:redis_test_password@127.0.0.1:56380
+ 
+ TELEGRAM_BOT_TOKEN=8544115698:AAE8SBtD3lwXEjjhazLRel18yXrke4b3B-8
++BOT_TOKEN=8544115698:AAE8SBtD3lwXEjjhazLRel18yXrke4b3B-8
+ TELEGRAM_WEBHOOK_URL="https://твой-рандомный-адрес.ngrok-free.app/webhook/telegram"
+ TELEGRAM_WEBHOOK_SECRET=your_webhook_secret_here
+ NEXT_PUBLIC_TELEGRAM_BOT_USERNAME=TodoAI
+ 
+ # Auth / crypto
+ JWT_SECRET=test-jwt-secret
++JWT_EXPIRES_IN=1h
++INIT_DATA_MAX_AGE_SECONDS=300
+ ENCRYPTION_KEY=0123456789abcdef0123456789abcdef
+
+diff --git a/test/helpers/generate-valid-init-data.ts b/test/helpers/generate-valid-init-data.ts
+new file mode 100644
+index 0000000..6ecc020
+--- /dev/null
++++ b/test/helpers/generate-valid-init-data.ts
+@@ -0,0 +1,64 @@
++import { createHmac } from 'crypto';
++import type { InitDataUser } from '../../src/modules/auth/interfaces/init-data.interface';
++
++interface InitDataOverrides {
++  authDate: number;
++  queryId: string;
++  startParam: string;
++}
++
++/**
++ * Generates a valid Telegram initData query string for tests.
++ */
++export function generateValidInitData(
++  botToken: string,
++  userData: InitDataUser,
++  overrides: Partial<InitDataOverrides> = {},
++): string {
++  const authDate = overrides.authDate ?? Math.floor(Date.now() / 1000);
++  const queryId = overrides.queryId ?? 'test-query-id';
++
++  const params = new URLSearchParams();
++  params.set('auth_date', String(authDate));
++  params.set('query_id', queryId);
++  params.set('user', JSON.stringify(userData));
++
++  if (overrides.startParam) {
++    params.set('start_param', overrides.startParam);
++  }
++
++  const dataCheckString = buildDataCheckString(params);
++  const secretKey = createHmac('sha256', 'WebAppData')
++    .update(botToken)
++    .digest();
++  const hash = createHmac('sha256', secretKey)
++    .update(dataCheckString)
++    .digest('hex');
++
++  secretKey.fill(0);
++  params.set('hash', hash);
++
++  return params.toString();
++}
++
++/**
++ * Generates valid initData and mutates one field to force hash mismatch.
++ */
++export function generateTamperedInitData(
++  botToken: string,
++  userData: InitDataUser,
++): string {
++  const initData = generateValidInitData(botToken, userData);
++  const params = new URLSearchParams(initData);
++  const queryId = params.get('query_id') ?? 'test-query-id';
++  params.set('query_id', `${queryId}-tampered`);
++  return params.toString();
++}
++
++function buildDataCheckString(params: URLSearchParams): string {
++  return [...params.entries()]
++    .filter(([key]) => key !== 'hash')
++    .sort(([left], [right]) => left.localeCompare(right))
++    .map(([key, value]) => `${key}=${value}`)
++    .join('\n');
++}
+
+diff --git a/test/unit/init-data-validation.service.spec.ts b/test/unit/init-data-validation.service.spec.ts
+new file mode 100644
+index 0000000..fdb4d11
+--- /dev/null
++++ b/test/unit/init-data-validation.service.spec.ts
+@@ -0,0 +1,119 @@
++import { ConfigService } from '@nestjs/config';
++import { HttpException } from '@nestjs/common';
++import { InitDataValidationService } from '../../src/modules/auth/services/init-data-validation.service';
++import {
++  AUTH_ERROR_CODES,
++  AUTH_ERROR_REGISTRY,
++} from '../../src/modules/auth/interfaces/jwt-payload.interface';
++import {
++  generateTamperedInitData,
++  generateValidInitData,
++} from '../helpers/generate-valid-init-data';
++
++describe('InitDataValidationService', () => {
++  const botToken = 'test-bot-token';
++  const baseConfigValues: Record<string, unknown> = {
++    BOT_TOKEN: botToken,
++    TELEGRAM_BOT_TOKEN: botToken,
++    INIT_DATA_MAX_AGE_SECONDS: 300,
++  };
++
++  const configService = {
++    get: jest.fn((key: string) => baseConfigValues[key]),
++  } as unknown as ConfigService;
++
++  const service = new InitDataValidationService(configService);
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++  });
++
++  it('validates a cryptographically correct initData payload', () => {
++    const initData = generateValidInitData(botToken, {
++      id: 123456789,
++      username: 'mini_user',
++      first_name: 'Mini',
++      last_name: 'User',
++      language_code: 'en',
++    });
++
++    const result = service.validate(initData);
++
++    expect(result.user.id).toBe(123456789);
++    expect(result.user.username).toBe('mini_user');
++    expect(result.hash).toHaveLength(64);
++    expect(result.dataCheckString).toContain('auth_date=');
++  });
++
++  it('throws AUTH_INIT_DATA_HASH_MISMATCH on tampered payload', () => {
++    const initData = generateTamperedInitData(botToken, {
++      id: 123456790,
++      username: 'tampered',
++    });
++
++    expect(() => service.validate(initData)).toThrow(HttpException);
++
++    try {
++      service.validate(initData);
++    } catch (error) {
++      expect(error).toBeInstanceOf(HttpException);
++      const httpError = error as HttpException;
++      expect(httpError.getStatus()).toBe(
++        AUTH_ERROR_REGISTRY.AUTH_INIT_DATA_HASH_MISMATCH.statusCode,
++      );
++      expect(httpError.getResponse()).toMatchObject({
++        code: AUTH_ERROR_CODES.AUTH_INIT_DATA_HASH_MISMATCH,
++      });
++    }
++  });
++
++  it('throws AUTH_INIT_DATA_EXPIRED when auth_date is stale', () => {
++    const staleAuthDate = Math.floor(Date.now() / 1000) - 301;
++    const initData = generateValidInitData(
++      botToken,
++      {
++        id: 123456791,
++      },
++      {
++        authDate: staleAuthDate,
++      },
++    );
++
++    expect(() => service.validate(initData)).toThrow(HttpException);
++
++    try {
++      service.validate(initData);
++    } catch (error) {
++      expect(error).toBeInstanceOf(HttpException);
++      const httpError = error as HttpException;
++      expect(httpError.getStatus()).toBe(
++        AUTH_ERROR_REGISTRY.AUTH_INIT_DATA_EXPIRED.statusCode,
++      );
++      expect(httpError.getResponse()).toMatchObject({
++        code: AUTH_ERROR_CODES.AUTH_INIT_DATA_EXPIRED,
++      });
++    }
++  });
++
++  it('throws AUTH_INVALID_INIT_DATA on malformed initData payload', () => {
++    const params = new URLSearchParams();
++    params.set('auth_date', String(Math.floor(Date.now() / 1000)));
++    params.set('query_id', 'query-id');
++    params.set('hash', '0'.repeat(64));
++
++    expect(() => service.validate(params.toString())).toThrow(HttpException);
++
++    try {
++      service.validate(params.toString());
++    } catch (error) {
++      expect(error).toBeInstanceOf(HttpException);
++      const httpError = error as HttpException;
++      expect(httpError.getStatus()).toBe(
++        AUTH_ERROR_REGISTRY.AUTH_INVALID_INIT_DATA.statusCode,
++      );
++      expect(httpError.getResponse()).toMatchObject({
++        code: AUTH_ERROR_CODES.AUTH_INVALID_INIT_DATA,
++      });
++    }
++  });
++});
+
+diff --git a/test/unit/jwt-auth.guard.spec.ts b/test/unit/jwt-auth.guard.spec.ts
+new file mode 100644
+index 0000000..2dbb161
+--- /dev/null
++++ b/test/unit/jwt-auth.guard.spec.ts
+@@ -0,0 +1,114 @@
++import { ExecutionContext, UnauthorizedException } from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { JwtAuthGuard } from '../../src/common/guards/jwt-auth.guard';
++import { JwtTokenService } from '../../src/modules/auth/services/jwt-token.service';
++import {
++  AUTH_ERROR_CODES,
++  JwtPayload,
++} from '../../src/modules/auth/interfaces/jwt-payload.interface';
++
++describe('JwtAuthGuard', () => {
++  const verifyAccessTokenMock = jest.fn();
++  const reflector = {
++    getAllAndOverride: jest.fn(),
++  } as unknown as Reflector;
++
++  const jwtTokenService = {
++    verifyAccessToken: verifyAccessTokenMock,
++  } as unknown as JwtTokenService;
++
++  const guard = new JwtAuthGuard(reflector, jwtTokenService);
++
++  beforeEach(() => {
++    jest.clearAllMocks();
++    reflector.getAllAndOverride = jest.fn().mockReturnValue(false);
++  });
++
++  it('allows routes decorated with @Public metadata', () => {
++    (reflector.getAllAndOverride as jest.Mock).mockReturnValue(true);
++
++    const context = createHttpContext({
++      method: 'GET',
++      path: '/private',
++      headers: {},
++    });
++
++    const result = guard.canActivate(context);
++
++    expect(result).toBe(true);
++    expect(verifyAccessTokenMock).not.toHaveBeenCalled();
++  });
++
++  it('allows safety-fallback public routes', () => {
++    const context = createHttpContext({
++      method: 'GET',
++      path: '/health',
++      headers: {},
++    });
++
++    const result = guard.canActivate(context);
++
++    expect(result).toBe(true);
++    expect(verifyAccessTokenMock).not.toHaveBeenCalled();
++  });
++
++  it('verifies bearer token and attaches request.user', () => {
++    const decodedPayload: JwtPayload = {
++      sub: '123456789',
++      uid: 'user-id',
++      username: 'mini_user',
++    };
++
++    verifyAccessTokenMock.mockReturnValue(decodedPayload);
++
++    const request = {
++      method: 'GET',
++      path: '/users',
++      headers: { authorization: 'Bearer valid.jwt.token' },
++    } as {
++      method: string;
++      path: string;
++      headers: { authorization: string };
++      user?: JwtPayload;
++    };
++    const context = createHttpContext(request);
++
++    const result = guard.canActivate(context);
++
++    expect(result).toBe(true);
++    expect(verifyAccessTokenMock).toHaveBeenCalledWith('valid.jwt.token');
++    expect(request.user).toEqual(decodedPayload);
++  });
++
++  it('throws AUTH_UNAUTHORIZED when Authorization header is missing', () => {
++    const context = createHttpContext({
++      method: 'GET',
++      path: '/users',
++      headers: {},
++    });
++
++    expect(() => guard.canActivate(context)).toThrow(UnauthorizedException);
++
++    try {
++      guard.canActivate(context);
++    } catch (error) {
++      expect(error).toBeInstanceOf(UnauthorizedException);
++      const unauthorized = error as UnauthorizedException;
++      expect(unauthorized.getResponse()).toMatchObject({
++        code: AUTH_ERROR_CODES.AUTH_UNAUTHORIZED,
++      });
++    }
++  });
++});
++
++function createHttpContext(request: Record<string, unknown>): ExecutionContext {
++  return {
++    switchToHttp: () => ({
++      getRequest: () => request,
++      getResponse: () => ({}),
++      getNext: () => undefined,
++    }),
++    getHandler: () => ({}),
++    getClass: () => class TestController {},
++  } as unknown as ExecutionContext;
++}
+
+diff --git a/test/integration/auth-telegram.integration-spec.ts b/test/integration/auth-telegram.integration-spec.ts
+new file mode 100644
+index 0000000..25efae4
+--- /dev/null
++++ b/test/integration/auth-telegram.integration-spec.ts
+@@ -0,0 +1,114 @@
++import { verify } from 'jsonwebtoken';
++import { PrismaService } from '../../src/prisma/prisma.service';
++import { JwtPayload } from '../../src/modules/auth/interfaces/jwt-payload.interface';
++import { createTestApp, TestApplication } from '../helpers/app';
++import {
++  generateTamperedInitData,
++  generateValidInitData,
++} from '../helpers/generate-valid-init-data';
++
++interface ErrorResponseBody {
++  error: {
++    code: string;
++  };
++}
++
++interface AuthTelegramSuccessBody {
++  accessToken: string;
++  tokenType: 'Bearer';
++  expiresIn: string;
++  user: {
++    id: string;
++    telegramId: string;
++    telegramName: string | null;
++    telegramPhoto: string | null;
++    locale: string;
++  };
++}
++
++describe('POST /auth/telegram (integration)', () => {
++  let testApp: TestApplication;
++  let prisma: PrismaService;
++
++  const botToken =
++    process.env.BOT_TOKEN ?? (process.env.TELEGRAM_BOT_TOKEN as string);
++  const jwtSecret = process.env.JWT_SECRET as string;
++
++  beforeAll(async () => {
++    testApp = await createTestApp();
++    prisma = testApp.app.get(PrismaService);
++  });
++
++  afterAll(async () => {
++    if (testApp) {
++      await testApp.close();
++    }
++  }, 10000);
++
++  it('returns access token and upserts user for valid initData', async () => {
++    const telegramId = Number(`77${Date.now().toString().slice(-8)}`);
++    const correlationId = 'auth-integration-correlation-id';
++    const initData = generateValidInitData(botToken, {
++      id: telegramId,
++      username: `mini_user_${telegramId}`,
++      first_name: 'Mini',
++      last_name: 'User',
++      photo_url: 'https://example.com/avatar.png',
++      language_code: 'EN-US',
++    });
++
++    const response = await testApp.request
++      .post('/auth/telegram')
++      .set('x-correlation-id', correlationId)
++      .send({ initData });
++    const body = response.body as AuthTelegramSuccessBody;
++
++    expect(response.status).toBe(200);
++    expect(response.headers['x-correlation-id']).toBe(correlationId);
++    expect(body.tokenType).toBe('Bearer');
++    expect(body.accessToken).toEqual(expect.any(String));
++    expect(body.user).toMatchObject({
++      telegramId: String(telegramId),
++      telegramName: `mini_user_${telegramId}`,
++      telegramPhoto: 'https://example.com/avatar.png',
++      locale: 'en-us',
++    });
++
++    const decoded = verify(body.accessToken, jwtSecret, {
++      algorithms: ['HS256'],
++    }) as JwtPayload;
++    expect(decoded.sub).toBe(String(telegramId));
++    expect(decoded.uid).toBe(body.user.id);
++
++    const storedUser = await prisma.user.findUnique({
++      where: { telegramId: BigInt(telegramId) },
++    });
++    expect(storedUser).toBeTruthy();
++    expect(storedUser?.telegramPhoto).toBe('https://example.com/avatar.png');
++    expect(storedUser?.locale).toBe('en-us');
++  });
++
++  it('returns AUTH_INIT_DATA_HASH_MISMATCH for tampered initData', async () => {
++    const telegramId = Number(`88${Date.now().toString().slice(-8)}`);
++    const initData = generateTamperedInitData(botToken, {
++      id: telegramId,
++      username: `tampered_${telegramId}`,
++    });
++
++    const response = await testApp.request
++      .post('/auth/telegram')
++      .send({ initData });
++    const body = response.body as ErrorResponseBody;
++
++    expect(response.status).toBe(401);
++    expect(body.error.code).toBe('AUTH_INIT_DATA_HASH_MISMATCH');
++  });
++
++  it('returns AUTH_INVALID_INIT_DATA for malformed request body', async () => {
++    const response = await testApp.request.post('/auth/telegram').send({});
++    const body = response.body as ErrorResponseBody;
++
++    expect(response.status).toBe(400);
++    expect(body.error.code).toBe('AUTH_INVALID_INIT_DATA');
++  });
++});
+

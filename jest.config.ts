@@ -5,7 +5,11 @@ dotenv.config({ path: '.env.test' });
 
 const config: Config = {
   rootDir: '.',
-  testMatch: ['<rootDir>/test/unit/**/*.spec.ts'],
+  // Option B: include *.unit-spec.ts so new unit suites run without renaming files.
+  testMatch: [
+    '<rootDir>/test/unit/**/*.spec.ts',
+    '<rootDir>/test/unit/**/*.unit-spec.ts',
+  ],
   moduleFileExtensions: ['js', 'json', 'ts'],
   transform: {
     '^.+\\.(t|j)s$': [

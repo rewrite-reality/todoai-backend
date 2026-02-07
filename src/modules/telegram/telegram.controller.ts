@@ -1,5 +1,6 @@
 import { Body, Controller, Headers, HttpCode, Post, Req } from '@nestjs/common';
 import type { Request } from 'express';
+import { Public } from '../../common/decorators/public.decorator';
 import { TelegramWebhookService } from './telegram-webhook.service';
 
 @Controller('webhook/telegram')
@@ -9,6 +10,7 @@ export class TelegramController {
   ) {}
 
   @Post()
+  @Public()
   @HttpCode(200)
   async handleWebhook(
     @Body() update: unknown,
