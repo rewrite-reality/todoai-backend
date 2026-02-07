@@ -16,7 +16,6 @@ export const DEFAULT_JOB_OPTIONS: RegisterQueueOptions['defaultJobOptions'] = {
 };
 
 export const QUEUES = {
-  TELEGRAM_UPDATES: 'telegram-updates',
   VOICE_TRANSCRIPTION: 'voice-transcription',
   TASK_PARSING: 'task-parsing',
   NOTIFICATIONS: 'notifications',

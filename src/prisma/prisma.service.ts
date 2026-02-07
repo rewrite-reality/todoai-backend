@@ -1,7 +1,7 @@
-import { Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { PrismaClient } from '@prisma/client';
+import { Injectable, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { PrismaPg } from '@prisma/adapter-pg';
+import { PrismaClient } from '@prisma/client';
 import { Pool } from 'pg';
 
 @Injectable()
@@ -9,16 +9,16 @@ export class PrismaService
   extends PrismaClient
   implements OnModuleInit, OnModuleDestroy
 {
+  private readonly pool: Pool;
+
   constructor(configService: ConfigService) {
-    // Создаём пул соединений PostgreSQL
     const connectionString = configService.get<string>('DATABASE_URL');
     const pool = new Pool({ connectionString });
-
-    // Создаём адаптер (требование Prisma 7)
     const adapter = new PrismaPg(pool);
 
-    // Передаём адаптер в PrismaClient
     super({ adapter });
+
+    this.pool = pool;
   }
 
   async onModuleInit() {
@@ -27,5 +27,8 @@ export class PrismaService
 
   async onModuleDestroy() {
     await this.$disconnect();
+    if (!this.pool.ended) {
+      await this.pool.end();
+    }
   }
 }
