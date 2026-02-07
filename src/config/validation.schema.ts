@@ -5,6 +5,7 @@ export const EnvironmentSchema = z.object({
   REDIS_HOST: z.string().min(1),
   REDIS_PORT: z.preprocess((val) => Number(val), z.number().int().positive()),
   TELEGRAM_BOT_TOKEN: z.string().min(1),
+  TELEGRAM_WEBHOOK_URL: z.string().url(),
   TELEGRAM_WEBHOOK_SECRET: z.string().min(1),
   JWT_SECRET: z.string().min(1),
   ENCRYPTION_KEY: z

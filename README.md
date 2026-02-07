@@ -118,3 +118,7 @@ docker compose -f docker-compose.test.yml up -d
 ## Лицензия
 
 UNLICENSED
+
+## Telegram routing
+
+Webhook ingress routes updates directly to downstream BullMQ queues (`task-parsing`, `voice-transcription`, command queues). A separate ingress queue is intentionally not used.

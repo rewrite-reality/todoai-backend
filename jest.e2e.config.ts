@@ -24,7 +24,6 @@ const config: Config = {
     '^(\\.\\.?/.*)\\.js$': '$1',
   },
   maxWorkers: 1,
-  forceExit: true,
 };
 
 export default config;

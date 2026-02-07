@@ -58,8 +58,10 @@ describe('Telegram webhook (e2e)', () => {
   });
 
   afterAll(async () => {
-    await testApp.close();
-  });
+    if (testApp) {
+      await testApp.close();
+    }
+  }, 10000);
 
   it('returns 403 TELEGRAM_INVALID_SECRET when header secret is invalid', async () => {
     const res = await testApp.request

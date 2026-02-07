@@ -1,3 +1,4 @@
+import { INestApplication } from '@nestjs/common';
 import { Test, TestingModule } from '@nestjs/testing';
 import { ConfigModule } from '@nestjs/config';
 import { getQueueToken } from '@nestjs/bullmq';
@@ -7,18 +8,21 @@ import { QUEUES } from '../../src/modules/queue/queues.config';
 import { TelegramQueueProducerService } from '../../src/modules/telegram/telegram-queue-producer.service';
 
 describe('TelegramQueueProducerService (integration)', () => {
-  let moduleRef: TestingModule;
+  let app: INestApplication | undefined;
   let producer: TelegramQueueProducerService;
   let taskParsingQueue: Queue;
 
   beforeAll(async () => {
-    moduleRef = await Test.createTestingModule({
+    const moduleRef: TestingModule = await Test.createTestingModule({
       imports: [ConfigModule.forRoot({ isGlobal: true }), QueueModule],
       providers: [TelegramQueueProducerService],
     }).compile();
 
-    producer = moduleRef.get(TelegramQueueProducerService);
-    taskParsingQueue = moduleRef.get<Queue>(getQueueToken(QUEUES.TASK_PARSING));
+    app = moduleRef.createNestApplication();
+    await app.init();
+
+    producer = app.get(TelegramQueueProducerService);
+    taskParsingQueue = app.get<Queue>(getQueueToken(QUEUES.TASK_PARSING));
   });
 
   beforeEach(async () => {
@@ -26,8 +30,10 @@ describe('TelegramQueueProducerService (integration)', () => {
   });
 
   afterAll(async () => {
-    await moduleRef.close();
-  });
+    if (app) {
+      await app.close();
+    }
+  }, 10000);
 
   it('deduplicates jobs by update_id through BullMQ jobId', async () => {
     const payload = {
