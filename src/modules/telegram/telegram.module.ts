@@ -9,7 +9,11 @@ import { TelegramQueueProducerService } from './telegram-queue-producer.service'
 @Module({
   imports: [QueueModule, UserModule],
   controllers: [TelegramController],
-  providers: [TelegramService, TelegramWebhookService, TelegramQueueProducerService],
+  providers: [
+    TelegramService,
+    TelegramWebhookService,
+    TelegramQueueProducerService,
+  ],
   exports: [TelegramService],
 })
 export class TelegramModule {}

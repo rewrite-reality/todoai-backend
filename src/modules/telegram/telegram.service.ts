@@ -1,6 +1,11 @@
 import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+interface TelegramApiResponse {
+  ok: boolean;
+  description?: string;
+}
+
 @Injectable()
 export class TelegramService implements OnModuleInit {
   private readonly logger = new Logger(TelegramService.name);
@@ -10,7 +15,10 @@ export class TelegramService implements OnModuleInit {
 
   constructor(private readonly configService: ConfigService) {
     this.botToken = this.configService.getOrThrow<string>('TELEGRAM_BOT_TOKEN');
-    this.webhookUrl = this.configService.get<string>('TELEGRAM_WEBHOOK_URL', '');
+    this.webhookUrl = this.configService.get<string>(
+      'TELEGRAM_WEBHOOK_URL',
+      '',
+    );
     this.webhookSecret = this.configService.getOrThrow<string>(
       'TELEGRAM_WEBHOOK_SECRET',
     );
@@ -27,14 +35,15 @@ export class TelegramService implements OnModuleInit {
 
     try {
       const response = await fetch(url);
-      const data = await response.json();
+      const data: unknown = await response.json();
 
-      if (data.ok) {
+      if (this.isTelegramApiResponse(data) && data.ok) {
         this.logger.log(`Webhook set successfully to ${this.webhookUrl}`);
         return;
       }
 
-      this.logger.error(`Failed to set webhook: ${data.description}`);
+      const description = this.getApiErrorDescription(data);
+      this.logger.error(`Failed to set webhook: ${description}`);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Error setting webhook: ${message}`);
@@ -54,5 +63,27 @@ export class TelegramService implements OnModuleInit {
       const message = error instanceof Error ? error.message : String(error);
       this.logger.error(`Failed to send message to ${chatId}: ${message}`);
     }
+  }
+
+  private isTelegramApiResponse(value: unknown): value is TelegramApiResponse {
+    if (!value || typeof value !== 'object') {
+      return false;
+    }
+
+    const maybeResponse = value as Partial<TelegramApiResponse>;
+    return typeof maybeResponse.ok === 'boolean';
+  }
+
+  private getApiErrorDescription(value: unknown): string {
+    if (
+      value &&
+      typeof value === 'object' &&
+      'description' in value &&
+      typeof value.description === 'string'
+    ) {
+      return value.description;
+    }
+
+    return 'Unknown Telegram API response';
   }
 }

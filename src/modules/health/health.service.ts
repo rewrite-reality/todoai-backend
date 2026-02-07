@@ -70,7 +70,7 @@ export class HealthService {
     try {
       await this.prisma.$queryRaw`SELECT 1`;
       return true;
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.warn({ msg: 'Database health failed', error });
       return false;
     }
@@ -80,7 +80,7 @@ export class HealthService {
     try {
       const pong = await this.redis.ping();
       return pong.toLowerCase() === 'pong';
-    } catch (error) {
+    } catch (error: unknown) {
       this.logger.warn({ msg: 'Redis health failed', error });
       return false;
     }

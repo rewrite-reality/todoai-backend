@@ -4,7 +4,9 @@ import { TelegramWebhookService } from './telegram-webhook.service';
 
 @Controller('webhook/telegram')
 export class TelegramController {
-  constructor(private readonly telegramWebhookService: TelegramWebhookService) {}
+  constructor(
+    private readonly telegramWebhookService: TelegramWebhookService,
+  ) {}
 
   @Post()
   @HttpCode(200)

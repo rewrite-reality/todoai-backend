@@ -1,5 +1,9 @@
 import { ForbiddenException, HttpException } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { TelegramWebhookService } from '../../src/modules/telegram/telegram-webhook.service';
+import { PinoLoggerService } from '../../src/common/logger/pino-logger.service';
+import { UserService } from '../../src/modules/user/user.service';
+import { TelegramQueueProducerService } from '../../src/modules/telegram/telegram-queue-producer.service';
 
 describe('TelegramWebhookService', () => {
   const configService = {
@@ -23,10 +27,10 @@ describe('TelegramWebhookService', () => {
   };
 
   const service = new TelegramWebhookService(
-    configService as any,
-    userService as any,
-    queueProducer as any,
-    logger as any,
+    configService as unknown as ConfigService,
+    userService as unknown as UserService,
+    queueProducer as unknown as TelegramQueueProducerService,
+    logger as unknown as PinoLoggerService,
   );
 
   const secret = 'sprint1-secret';

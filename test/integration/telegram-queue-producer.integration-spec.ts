@@ -54,9 +54,7 @@ describe('TelegramQueueProducerService (integration)', () => {
       'failed',
       'paused',
     ]);
-    const sameIdJobs = allJobs.filter(
-      (job) => job.id === jobId,
-    );
+    const sameIdJobs = allJobs.filter((job) => job.id === jobId);
 
     expect(sameIdJobs).toHaveLength(1);
   });

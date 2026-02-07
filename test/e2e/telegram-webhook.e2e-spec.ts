@@ -4,6 +4,12 @@ import { PrismaService } from '../../src/prisma/prisma.service';
 import { QUEUES } from '../../src/modules/queue/queues.config';
 import { createTestApp, TestApplication } from '../helpers/app';
 
+interface ErrorResponseBody {
+  error: {
+    code: string;
+  };
+}
+
 describe('Telegram webhook (e2e)', () => {
   let testApp: TestApplication;
   let prisma: PrismaService;
@@ -23,13 +29,19 @@ describe('Telegram webhook (e2e)', () => {
     taskParsingQueue = testApp.app.get(getQueueToken(QUEUES.TASK_PARSING));
     voiceQueue = testApp.app.get(getQueueToken(QUEUES.VOICE_TRANSCRIPTION));
     notificationsQueue = testApp.app.get(getQueueToken(QUEUES.NOTIFICATIONS));
-    userConnectionQueue = testApp.app.get(getQueueToken(QUEUES.USER_CONNECTION));
+    userConnectionQueue = testApp.app.get(
+      getQueueToken(QUEUES.USER_CONNECTION),
+    );
     inviteAcceptanceQueue = testApp.app.get(
       getQueueToken(QUEUES.INVITE_ACCEPTANCE),
     );
     inviteDeclineQueue = testApp.app.get(getQueueToken(QUEUES.INVITE_DECLINE));
-    assigneeRevokeQueue = testApp.app.get(getQueueToken(QUEUES.ASSIGNEE_REVOKE));
-    assignmentsListQueue = testApp.app.get(getQueueToken(QUEUES.ASSIGNMENTS_LIST));
+    assigneeRevokeQueue = testApp.app.get(
+      getQueueToken(QUEUES.ASSIGNEE_REVOKE),
+    );
+    assignmentsListQueue = testApp.app.get(
+      getQueueToken(QUEUES.ASSIGNMENTS_LIST),
+    );
   });
 
   beforeEach(async () => {
@@ -54,9 +66,10 @@ describe('Telegram webhook (e2e)', () => {
       .post('/webhook/telegram')
       .set('x-telegram-bot-api-secret-token', 'invalid-secret')
       .send({ update_id: 1 });
+    const body = res.body as ErrorResponseBody;
 
     expect(res.status).toBe(403);
-    expect(res.body.error.code).toBe('TELEGRAM_INVALID_SECRET');
+    expect(body.error.code).toBe('TELEGRAM_INVALID_SECRET');
   });
 
   it('returns 400 TELEGRAM_INVALID_PAYLOAD for malformed payload', async () => {
@@ -64,9 +77,10 @@ describe('Telegram webhook (e2e)', () => {
       .post('/webhook/telegram')
       .set('x-telegram-bot-api-secret-token', secret)
       .send({ not_update: true });
+    const body = res.body as ErrorResponseBody;
 
     expect(res.status).toBe(400);
-    expect(res.body.error.code).toBe('TELEGRAM_INVALID_PAYLOAD');
+    expect(body.error.code).toBe('TELEGRAM_INVALID_PAYLOAD');
   });
 
   it('enqueues text update into task-parsing, upserts user, and responds under 200ms', async () => {
@@ -99,7 +113,9 @@ describe('Telegram webhook (e2e)', () => {
     expect(res.headers['x-correlation-id']).toBe(correlationId);
     expect(elapsedMs).toBeLessThan(200);
 
-    const storedJob = await taskParsingQueue.getJob(`telegram-update-${updateId}`);
+    const storedJob = await taskParsingQueue.getJob(
+      `telegram-update-${updateId}`,
+    );
     expect(storedJob).toBeDefined();
     expect(storedJob?.data).toMatchObject({
       telegramUpdateId: updateId,
@@ -189,8 +205,10 @@ describe('Telegram webhook (e2e)', () => {
     const storedJob = await queueByName[queueName].getJob(
       `telegram-update-${updateId}`,
     );
+    const queuedCommand = (storedJob?.data as { command?: string } | undefined)
+      ?.command;
     expect(storedJob).toBeDefined();
-    expect(storedJob?.data.command).toBe(command);
+    expect(queuedCommand).toBe(command);
   });
 
   it('prevents duplicate enqueue by update_id', async () => {
@@ -248,8 +266,12 @@ describe('Telegram webhook (e2e)', () => {
 
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
-    expect(await taskParsingQueue.getJob(`telegram-update-${updateId}`)).toBeFalsy();
+    expect(
+      await taskParsingQueue.getJob(`telegram-update-${updateId}`),
+    ).toBeFalsy();
     expect(await voiceQueue.getJob(`telegram-update-${updateId}`)).toBeFalsy();
-    expect(await notificationsQueue.getJob(`telegram-update-${updateId}`)).toBeFalsy();
+    expect(
+      await notificationsQueue.getJob(`telegram-update-${updateId}`),
+    ).toBeFalsy();
   });
 });

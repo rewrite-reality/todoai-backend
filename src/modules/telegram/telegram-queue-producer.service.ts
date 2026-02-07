@@ -34,7 +34,10 @@ interface CommandQueueRoute {
 
 @Injectable()
 export class TelegramQueueProducerService {
-  private readonly commandRoutes: Record<SupportedTelegramCommand, CommandQueueRoute>;
+  private readonly commandRoutes: Record<
+    SupportedTelegramCommand,
+    CommandQueueRoute
+  >;
 
   constructor(
     @InjectQueue(QUEUES.TASK_PARSING) private readonly taskParsingQueue: Queue,
@@ -81,13 +84,17 @@ export class TelegramQueueProducerService {
     };
   }
 
-  async enqueueTaskParsing(payload: TelegramTaskParsingJobPayload): Promise<void> {
+  async enqueueTaskParsing(
+    payload: TelegramTaskParsingJobPayload,
+  ): Promise<void> {
     await this.taskParsingQueue.add('parse-task', payload, {
       jobId: this.buildJobId(payload.telegramUpdateId),
     });
   }
 
-  async enqueueVoiceTranscription(payload: TelegramVoiceJobPayload): Promise<void> {
+  async enqueueVoiceTranscription(
+    payload: TelegramVoiceJobPayload,
+  ): Promise<void> {
     await this.voiceTranscriptionQueue.add('transcribe-voice', payload, {
       jobId: this.buildJobId(payload.telegramUpdateId),
     });
