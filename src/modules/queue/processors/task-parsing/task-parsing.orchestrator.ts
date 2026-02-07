@@ -70,6 +70,8 @@ export class TaskParsingOrchestrator {
         jobId: job.id,
         idempotencyKey: payload.idempotencyKey,
         code: mappedError.code,
+        errorMessage: mappedError.message,
+        details: mappedError.details,
       });
     } finally {
       this.metrics.observeAiParseDuration(

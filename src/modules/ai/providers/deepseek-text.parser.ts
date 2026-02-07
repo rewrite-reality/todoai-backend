@@ -133,33 +133,46 @@ export class DeepSeekTextParser implements IAiParser {
     }
 
     if (response.status === 429) {
+      const responseBody = await this.safeReadResponseText(response);
       throw new AiParserError(
         'AI_PARSE_RATE_LIMIT',
         'AI provider rate limit exceeded',
         {
           retriable: true,
+          details: {
+            status: response.status,
+            body: responseBody,
+          },
         },
       );
     }
 
     if (response.status >= 500) {
+      const responseBody = await this.safeReadResponseText(response);
       throw new AiParserError(
         'AI_PARSE_PROVIDER_ERROR',
         'AI provider server error',
         {
           retriable: true,
-          details: { status: response.status },
+          details: {
+            status: response.status,
+            body: responseBody,
+          },
         },
       );
     }
 
     if (!response.ok) {
+      const responseBody = await this.safeReadResponseText(response);
       throw new AiParserError(
         'AI_PARSE_PROVIDER_ERROR',
         `AI provider returned status ${response.status}`,
         {
           retriable: false,
-          details: { status: response.status },
+          details: {
+            status: response.status,
+            body: responseBody,
+          },
         },
       );
     }
@@ -214,5 +227,14 @@ export class DeepSeekTextParser implements IAiParser {
       'name' in error &&
       error.name === 'AbortError'
     );
+  }
+
+  private async safeReadResponseText(response: Response): Promise<string> {
+    try {
+      const text = await response.text();
+      return text.slice(0, 2000);
+    } catch {
+      return '';
+    }
   }
 }
