@@ -4,19 +4,26 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { Queue } from 'bullmq';
 import { DEFAULT_JOB_OPTIONS, QUEUES } from './queues.config';
 import { ObservabilityModule } from '../../common/observability/observability.module';
-import { TaskParsingProcessor } from './processors/task-parsing.processor';
-import { VoiceTranscriptionProcessor } from './processors/voice-transcription.processor';
-import { NotificationProcessor } from './processors/notification.processor';
-import { UserConnectionProcessor } from './processors/user-connection.processor';
-import { InviteAcceptanceProcessor } from './processors/invite-acceptance.processor';
-import { InviteDeclineProcessor } from './processors/invite-decline.processor';
-import { AssigneeRevokeProcessor } from './processors/assignee-revoke.processor';
-import { AssignmentsListProcessor } from './processors/assignments-list.processor';
+import { TaskParsingProcessor } from './processors/task-parsing/task-parsing.processor';
+import { VoiceTranscriptionProcessor } from './processors/voice/voice-transcription.processor';
+import { NotificationProcessor } from './processors/notifications/notification.processor';
+import { UserConnectionProcessor } from './processors/commands/user-connection.processor';
+import { InviteAcceptanceProcessor } from './processors/commands/invite-acceptance.processor';
+import { InviteDeclineProcessor } from './processors/commands/invite-decline.processor';
+import { AssigneeRevokeProcessor } from './processors/commands/assignee-revoke.processor';
+import { AssignmentsListProcessor } from './processors/commands/assignments-list.processor';
+import { TaskParsingOrchestrator } from './processors/task-parsing/task-parsing.orchestrator';
+import { TaskParsingPersistenceService } from './processors/task-parsing/task-parsing.persistence.service';
+import { TaskParsingNotificationService } from './processors/task-parsing/task-parsing.notification.service';
+import { AiModule } from '../ai/ai.module';
+import { PrismaModule } from '../../prisma/prisma.module';
 
 @Global()
 @Module({
   imports: [
     ObservabilityModule,
+    AiModule,
+    PrismaModule,
     BullModule.forRootAsync({
       imports: [ConfigModule],
       useFactory: (configService: ConfigService) => ({
@@ -36,7 +43,10 @@ import { AssignmentsListProcessor } from './processors/assignments-list.processo
       },
       {
         name: QUEUES.TASK_PARSING,
-        defaultJobOptions: DEFAULT_JOB_OPTIONS,
+        defaultJobOptions: {
+          ...DEFAULT_JOB_OPTIONS,
+          attempts: 1,
+        },
         forceDisconnectOnShutdown: true,
       },
       {
@@ -72,6 +82,9 @@ import { AssignmentsListProcessor } from './processors/assignments-list.processo
     ),
   ],
   providers: [
+    TaskParsingOrchestrator,
+    TaskParsingPersistenceService,
+    TaskParsingNotificationService,
     TaskParsingProcessor,
     VoiceTranscriptionProcessor,
     NotificationProcessor,

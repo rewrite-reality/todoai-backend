@@ -1,3 +1,5 @@
+import { z } from 'zod';
+
 export interface TelegramUser {
   id: number;
   username?: string;
@@ -25,6 +27,34 @@ export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
 }
+
+const TelegramUserSchema = z.object({
+  id: z.number().int(),
+  username: z.string().optional(),
+  first_name: z.string().optional(),
+  last_name: z.string().optional(),
+});
+
+const TelegramChatSchema = z.object({
+  id: z.number().int(),
+});
+
+const TelegramVoiceSchema = z.object({
+  file_id: z.string().trim().min(1),
+});
+
+const TelegramMessageSubsetSchema = z.object({
+  message_id: z.number().int(),
+  from: TelegramUserSchema,
+  chat: TelegramChatSchema,
+  text: z.string().optional(),
+  voice: TelegramVoiceSchema.optional(),
+});
+
+export const TelegramUpdateSubsetSchema = z.object({
+  update_id: z.number().int(),
+  message: TelegramMessageSubsetSchema.optional(),
+});
 
 export type SupportedTelegramCommand =
   | '/start'

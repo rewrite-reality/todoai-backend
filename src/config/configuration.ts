@@ -17,5 +17,12 @@ export default () => {
     jwtExpiresIn: envVars.JWT_EXPIRES_IN,
     initDataMaxAgeSeconds: envVars.INIT_DATA_MAX_AGE_SECONDS,
     encryptionKey: envVars.ENCRYPTION_KEY,
+    ai: {
+      textProvider: envVars.AI_TEXT_PROVIDER,
+      deepseekApiKey: envVars.DEEPSEEK_API_KEY,
+      deepseekBaseUrl: envVars.DEEPSEEK_BASE_URL,
+      deepseekModel: envVars.DEEPSEEK_MODEL,
+      timeoutMs: envVars.AI_TIMEOUT_MS,
+    },
   };
 };

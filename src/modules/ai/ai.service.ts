@@ -2,8 +2,9 @@ import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import OpenAI from 'openai';
 import { zodResponseFormat } from 'openai/helpers/zod';
-import { TASK_PARSER_SYSTEM_PROMPT } from './prompts/task-parser.prompt';
-import { ParsedTask, ParsedTaskSchema } from './validators/ai-output.validator';
+import type { ParsedTaskDto } from './dto/parsed-task.dto';
+import { buildDeepSeekTaskParserSystemPrompt } from './prompts/deepseek-task-parser.prompt';
+import { ParsedTaskSchema } from './validators/ai-output.validator';
 
 @Injectable()
 export class AiService {
@@ -22,14 +23,17 @@ export class AiService {
     });
   }
 
-  async parseTask(input: string, timezone = 'UTC'): Promise<ParsedTask> {
+  async parseTask(input: string, timezone = 'UTC'): Promise<ParsedTaskDto> {
     try {
       const isGoogle = this.baseUrl?.includes('googleapis') ?? false;
       const safeTimezone = timezone?.trim() || 'UTC';
-      const systemPrompt = `${TASK_PARSER_SYSTEM_PROMPT(
-        new Date().toISOString(),
-        safeTimezone,
-      )}${isGoogle ? ' RETURN ONLY VALID JSON.' : ''}`;
+      const systemPrompt = [
+        buildDeepSeekTaskParserSystemPrompt(new Date().toISOString()),
+        `User timezone: ${safeTimezone}`,
+        isGoogle ? 'RETURN ONLY VALID JSON.' : '',
+      ]
+        .filter((line) => line.length > 0)
+        .join('\n');
 
       if (isGoogle) {
         const response = await this.client.chat.completions.create({
@@ -78,15 +82,13 @@ export class AiService {
       const title = normalizedInput.slice(0, 100);
       const isTruncated = normalizedInput.length > 100;
 
-      const fallback: ParsedTask = {
-        isIgnored: false,
+      const fallback: ParsedTaskDto = {
         tasks: [
           {
             title: title || 'Untitled task',
             deadline: null,
             summary: isTruncated ? normalizedInput : undefined,
             subtasks: [],
-            priority: 'MEDIUM',
           },
         ],
       };
