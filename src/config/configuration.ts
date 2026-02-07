@@ -12,7 +12,10 @@ export default () => {
       botToken: envVars.TELEGRAM_BOT_TOKEN,
       webhookSecret: envVars.TELEGRAM_WEBHOOK_SECRET,
     },
+    botToken: envVars.BOT_TOKEN ?? envVars.TELEGRAM_BOT_TOKEN,
     jwtSecret: envVars.JWT_SECRET,
+    jwtExpiresIn: envVars.JWT_EXPIRES_IN,
+    initDataMaxAgeSeconds: envVars.INIT_DATA_MAX_AGE_SECONDS,
     encryptionKey: envVars.ENCRYPTION_KEY,
   };
 };

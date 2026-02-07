@@ -27,12 +27,27 @@ export class AllExceptionsFilter implements ExceptionFilter {
     const request = ctx.getRequest<Request>();
 
     const { status, body } = this.mapException(exception);
+    const correlationId = this.getCorrelationId(request);
 
-    this.logger.error({
-      status,
-      path: request.url,
-      error: exception instanceof Error ? exception.message : String(exception),
-    });
+    if (this.isAuthFailure(body.error.code)) {
+      this.logger.warn({
+        msg: 'Authentication request failed',
+        correlationId,
+        code: body.error.code,
+        reason: body.error.message,
+        status,
+        path: request.url,
+      });
+    } else {
+      this.logger.error({
+        msg: 'HTTP request failed',
+        correlationId,
+        code: body.error.code,
+        reason: body.error.message,
+        status,
+        path: request.url,
+      });
+    }
 
     response.status(status).json(body);
   }
@@ -145,5 +160,14 @@ export class AllExceptionsFilter implements ExceptionFilter {
     }
 
     return { error: payload };
+  }
+
+  private isAuthFailure(code: string): boolean {
+    return code.startsWith('AUTH_');
+  }
+
+  private getCorrelationId(request: Request): string {
+    const req = request as Request & { correlationId?: string };
+    return req.correlationId ?? 'unknown-correlation-id';
   }
 }

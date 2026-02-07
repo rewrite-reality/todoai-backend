@@ -1,5 +1,5 @@
 import { MiddlewareConsumer, Module, NestModule } from '@nestjs/common';
-import { APP_FILTER } from '@nestjs/core';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
@@ -13,6 +13,8 @@ import { CorrelationIdMiddleware } from './common/middleware/correlation-id.midd
 import { ObservabilityModule } from './common/observability/observability.module';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
 import { RedisModule } from './common/redis/redis.module';
+import { AuthModule } from './modules/auth/auth.module';
+import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 
 @Module({
   imports: [
@@ -26,6 +28,7 @@ import { RedisModule } from './common/redis/redis.module';
     ObservabilityModule,
     RedisModule,
     PrismaModule,
+    AuthModule,
     TelegramModule,
     QueueModule,
     HealthModule,
@@ -36,6 +39,10 @@ import { RedisModule } from './common/redis/redis.module';
     {
       provide: APP_FILTER,
       useClass: AllExceptionsFilter,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
     },
   ],
 })
